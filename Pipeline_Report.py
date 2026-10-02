@@ -1,2033 +1,3003 @@
- 
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
-"""
-GWAS2m PIPELINE REPORTER
-========================
-
-Reads saved outputs from the GWAS2m pipeline for ONE phenotype + ancestry,
-prints compact tables to the terminal, and saves the full tables under:
-
-    reports/<phenotype>/<ancestry>/
-
-Example:
-    python Pipeline_Report.py --phenotype migraine --ancestry EUR
-
-Optional:
-    python Pipeline_Report.py \
-        --phenotype migraine \
-        --ancestry EUR \
-        --study GCST90129450 \
-        --max-rows 40 \
-        --common-pip 0.01
-
-This script DOES NOT rerun any biological analysis.
-It only summarizes files that already exist.
-"""
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
-import sys
-from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import polars as pl
+
+from scipy.stats import rankdata
+
+
+VERSION = "4.0.0-fast-common-loci"
 
 
 # =============================================================================
-# CONFIG
+# ANCESTRY
 # =============================================================================
 
-REPORT_VERSION = "1.0.0"
+ANCESTRY = {
 
-ANCESTRY_ALIASES = {
-    "eur": ("EUR", "European"),
-    "european": ("EUR", "European"),
-    "afr": ("AFR", "African"),
-    "african": ("AFR", "African"),
-    "eas": ("EAS", "East Asian"),
-    "east asian": ("EAS", "East Asian"),
-    "sas": ("SAS", "South Asian"),
-    "south asian": ("SAS", "South Asian"),
-    "amr": ("AMR", "Hispanic or Latin American"),
-    "hispanic": ("AMR", "Hispanic or Latin American"),
-    "latino": ("AMR", "Hispanic or Latin American"),
-    "hispanic or latin american": ("AMR", "Hispanic or Latin American"),
+    "eur":
+        ("EUR", "European"),
+
+    "european":
+        ("EUR", "European"),
+
+    "afr":
+        ("AFR", "African"),
+
+    "african":
+        ("AFR", "African"),
+
+    "eas":
+        ("EAS", "East Asian"),
+
+    "east asian":
+        ("EAS", "East Asian"),
+
+    "sas":
+        ("SAS", "South Asian"),
+
+    "south asian":
+        ("SAS", "South Asian"),
+
+    "amr":
+        ("AMR", "Hispanic or Latin American"),
+
+    "hispanic":
+        ("AMR", "Hispanic or Latin American"),
+
+    "latino":
+        ("AMR", "Hispanic or Latin American"),
+
+    "hispanic or latin american":
+        ("AMR", "Hispanic or Latin American"),
 }
 
-STEP_NAMES = {
-    "STEP01": "GWAS discovery / planning",
-    "STEP02": "Downloaded summary statistics",
-    "STEP03": "GWAS QC / harmonization",
-    "STEP04": "Ancestry-specific LD reference",
-    "STEP05": "LD clumping / loci",
-    "STEP06": "SuSiE fine-mapping",
-    "STEP07": "VEP functional annotation",
-    "STEP08": "GTEx v11 eQTL / sQTL",
-    "STEP09": "SpliceAI",
-    "STEP10": "Pangolin",
-    "STEP11": "GTEx v11 SuSiE colocalization",
-}
-
 
 # =============================================================================
-# GENERAL HELPERS
+# BASIC HELPERS
 # =============================================================================
 
-def normalize_text(value: object) -> str:
-    x = str(value).lower()
-    x = re.sub(r"[^a-z0-9]+", " ", x)
-    return re.sub(r"\s+", " ", x).strip()
-
-
-def slugify(value: object) -> str:
-    return normalize_text(value).replace(" ", "_")
-
-
-def canonical_ancestry(value: str) -> tuple[str, str]:
-    key = normalize_text(value)
-    if key not in ANCESTRY_ALIASES:
-        raise ValueError(
-            f"Unsupported ancestry {value!r}. "
-            "Use EUR, AFR, EAS, SAS, or AMR."
-        )
-    return ANCESTRY_ALIASES[key]
-
-
-def safe_json(path: Path) -> dict:
-    if not path.exists() or path.stat().st_size == 0:
-        return {}
-    try:
-        return json.loads(path.read_text(encoding="utf-8", errors="replace"))
-    except Exception:
-        return {}
-
-
-def safe_tsv(path: Path, **kwargs) -> pd.DataFrame:
-    if not path.exists() or path.stat().st_size == 0:
-        return pd.DataFrame()
-    try:
-        return pd.read_csv(
-            path,
-            sep="\t",
-            compression="infer",
-            low_memory=False,
-            **kwargs,
-        )
-    except Exception:
-        return pd.DataFrame()
-
-
-def first_existing(paths) -> Path | None:
-    for p in paths:
-        p = Path(p)
-        if p.exists() and p.is_file() and p.stat().st_size > 0:
-            return p
-    return None
-
-
-def first_glob(root: Path, patterns) -> Path | None:
-    if not root.exists():
-        return None
-    for pattern in patterns:
-        matches = sorted(
-            p for p in root.glob(pattern)
-            if p.is_file() and p.stat().st_size > 0
-        )
-        if matches:
-            return matches[0]
-    return None
-
-
-def first_present(columns, aliases) -> str | None:
-    lookup = {str(c).lower(): c for c in columns}
-    for alias in aliases:
-        if alias.lower() in lookup:
-            return lookup[alias.lower()]
-    return None
-
-
-def number(value, default=np.nan):
-    if value is None:
-        return default
-    try:
-        if isinstance(value, str):
-            value = value.strip().replace(",", "")
-            if not value:
-                return default
-        return float(value)
-    except Exception:
-        return default
-
-
-def integer(value, default=np.nan):
-    x = number(value, default=np.nan)
-    if pd.isna(x):
-        return default
-    return int(x)
-
-
-def json_value(data: dict, keys, default=np.nan):
-    for key in keys:
-        if key in data and data[key] not in (None, ""):
-            return data[key]
-    return default
-
-
-def df_value(df: pd.DataFrame, keys, default=np.nan):
-    if df.empty:
-        return default
-
-    # long format: metric/value or key/value
-    key_col = first_present(df.columns, ["metric", "key", "name", "parameter"])
-    val_col = first_present(df.columns, ["value", "count", "result"])
-
-    if key_col and val_col:
-        mapping = {
-            str(k).strip().lower(): v
-            for k, v in zip(df[key_col], df[val_col])
-        }
-        for key in keys:
-            if key.lower() in mapping:
-                return mapping[key.lower()]
-
-    # wide format
-    for key in keys:
-        col = first_present(df.columns, [key])
-        if col and len(df):
-            return df.iloc[0][col]
-
-    return default
-
-
-def human_size(size: int) -> str:
-    x = float(size)
-    units = ["B", "KB", "MB", "GB", "TB"]
-    for unit in units:
-        if x < 1024 or unit == units[-1]:
-            return f"{x:.1f} {unit}"
-        x /= 1024
-    return f"{x:.1f} TB"
-
-
-def variant_key(chrom, pos, ref, alt) -> str | None:
-    try:
-        chrom = str(chrom).strip()
-        chrom = re.sub(r"^chr", "", chrom, flags=re.I)
-        chrom = str(int(float(chrom)))
-        pos = int(float(pos))
-    except Exception:
-        return None
-
-    ref = str(ref).strip().upper()
-    alt = str(alt).strip().upper()
-
-    if not ref or not alt or ref in {"NAN", "NA", "."} or alt in {"NAN", "NA", "."}:
-        return None
-
-    return f"{chrom}:{pos}:{ref}:{alt}"
-
-
-def status_from_json(data: dict, default="MISSING") -> str:
-    if not data:
-        return default
-    status = str(data.get("STATUS", "")).strip().upper()
-    return status or "PRESENT"
-
-
-def output_exists(path: Path | None) -> bool:
-    return bool(path and path.exists() and path.stat().st_size > 0)
-
-
-# =============================================================================
-# TERMINAL + FILE OUTPUT
-# =============================================================================
-
-class Tee:
-    def __init__(self, *streams):
-        self.streams = streams
-
-    def write(self, text):
-        for stream in self.streams:
-            stream.write(text)
-            stream.flush()
-
-    def flush(self):
-        for stream in self.streams:
-            stream.flush()
-
-
-def section(title: str):
-    print()
-    print("=" * 120)
-    print(title)
-    print("=" * 120)
-
-
-def print_table(
-    title: str,
-    df: pd.DataFrame,
-    max_rows: int = 25,
-    columns: list[str] | None = None,
+def norm(
+    value,
 ):
-    section(title)
 
-    if df is None or df.empty:
-        print("(no rows)")
+    return re.sub(
+
+        r"\s+",
+
+        " ",
+
+        re.sub(
+
+            r"[^a-z0-9]+",
+
+            " ",
+
+            str(
+                value
+            ).lower(),
+        ),
+
+    ).strip()
+
+
+def slug(
+    value,
+):
+
+    return norm(
+        value
+    ).replace(
+        " ",
+        "_",
+    )
+
+
+def ancestry_info(
+    value,
+):
+
+    key = norm(
+        value
+    )
+
+    if key not in ANCESTRY:
+
+        raise SystemExit(
+            f"Unsupported ancestry: {value}"
+        )
+
+    return ANCESTRY[
+        key
+    ]
+
+
+def section(
+    title,
+    char="=",
+):
+
+    print()
+
+    print(
+        char
+        *
+        150
+    )
+
+    print(
+        title
+    )
+
+    print(
+        char
+        *
+        150
+    )
+
+
+def show(
+    df,
+    title,
+    max_rows=None,
+):
+
+    section(
+        title,
+        "-",
+    )
+
+    if df is None:
+
+        print(
+            "(no table)"
+        )
+
         return
 
-    x = df.copy()
+    if isinstance(
+        df,
+        pl.DataFrame,
+    ):
 
-    if columns:
-        keep = [c for c in columns if c in x.columns]
-        if keep:
-            x = x[keep]
+        df = df.to_pandas()
 
-    shown = x.head(max_rows)
+    if len(
+        df
+    ) == 0:
+
+        print(
+            "(no rows)"
+        )
+
+        return
+
+    if (
+        max_rows
+        and
+        len(df)
+        >
+        max_rows
+    ):
+
+        shown = df.head(
+            max_rows
+        )
+
+    else:
+
+        shown = df
 
     with pd.option_context(
-        "display.max_rows", max_rows,
-        "display.max_columns", 100,
-        "display.width", 240,
-        "display.max_colwidth", 50,
-        "display.float_format", lambda v: f"{v:.6g}",
+
+        "display.max_rows",
+        None,
+
+        "display.max_columns",
+        None,
+
+        "display.width",
+        600,
+
+        "display.max_colwidth",
+        70,
+
+        "display.expand_frame_repr",
+        False,
+
+        "display.float_format",
+        lambda x:
+            f"{x:.6g}",
+
     ):
-        print(shown.to_string(index=False))
 
-    if len(x) > max_rows:
-        print()
         print(
-            f"... showing first {max_rows:,} of {len(x):,} rows. "
-            "The full table is saved to disk."
-        )
-
-
-def save_table(df: pd.DataFrame, path: Path):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(path, sep="\t", index=False)
-
-
-# =============================================================================
-# CLI
-# =============================================================================
-
-def parse_args():
-    p = argparse.ArgumentParser(
-        description="Print and save a GWAS2m phenotype/ancestry pipeline report."
-    )
-
-    p.add_argument("--phenotype", required=True)
-    p.add_argument("--ancestry", required=True)
-
-    p.add_argument(
-        "--study",
-        default=None,
-        help="Optional single GCST accession, e.g. GCST90129450.",
-    )
-
-    p.add_argument(
-        "--max-rows",
-        type=int,
-        default=25,
-        help="Maximum rows printed for large tables. Full tables are still saved.",
-    )
-
-    p.add_argument(
-        "--common-pip",
-        type=float,
-        default=0.01,
-        help="Minimum Step06 PIP used for cross-GWAS common-variant reporting.",
-    )
-
-    return p.parse_args()
-
-
-# =============================================================================
-# PATHS / STUDY DISCOVERY
-# =============================================================================
-
-def build_paths(
-    root: Path,
-    phenotype_slug: str,
-    ancestry_slug: str,
-):
-    return {
-        "step02": root / "02_summary_stats" / phenotype_slug / ancestry_slug,
-        "step05": root / "05_ld_clumping" / phenotype_slug / ancestry_slug,
-        "step06": root / "06_finemapping" / phenotype_slug / ancestry_slug,
-        "step07": root / "07_annotation" / phenotype_slug / ancestry_slug,
-        "step08": root / "08_qtl" / phenotype_slug / ancestry_slug,
-        "step09": root / "09_splicing" / phenotype_slug / ancestry_slug,
-        "step10": root / "10_pangolin" / phenotype_slug / ancestry_slug,
-        "step11": root / "11_coloc" / phenotype_slug / ancestry_slug,
-    }
-
-
-def discover_studies(paths: dict[str, Path]) -> list[str]:
-    studies = set()
-
-    for base in paths.values():
-        if not base.exists():
-            continue
-
-        for p in base.glob("GCST*"):
-            if p.is_dir():
-                studies.add(p.name)
-
-        for p in base.rglob("GCST*"):
-            name = p.name
-            m = re.search(r"(GCST\d+)", name)
-            if m:
-                studies.add(m.group(1))
-
-    # manifests / exclusions can mention studies not represented by a directory
-    for base in paths.values():
-        if not base.exists():
-            continue
-
-        for tsv in base.glob("*.tsv"):
-            if "manifest" not in tsv.name.lower() and "excluded" not in tsv.name.lower():
-                continue
-
-            df = safe_tsv(tsv, dtype=str)
-
-            col = first_present(
-                df.columns,
-                ["STUDY_ACCESSION", "ACCESSION", "GCST"],
+            shown.to_string(
+                index=False
             )
+        )
 
-            if col:
-                for x in df[col].dropna().astype(str):
-                    m = re.search(r"(GCST\d+)", x)
-                    if m:
-                        studies.add(m.group(1))
+    if (
+        max_rows
+        and
+        len(df)
+        >
+        max_rows
+    ):
 
-    return sorted(studies)
+        print(
+            f"\n[showing "
+            f"{max_rows}/"
+            f"{len(df)} rows]"
+        )
 
 
-# =============================================================================
-# STEP 01 / 02
-# =============================================================================
-
-def summarize_step01_02(
-    studies: list[str],
-    paths: dict[str, Path],
+def first_file(
+    directory,
+    patterns,
 ):
-    rows = []
 
-    base = paths["step02"]
-    qc_root = base / "qc"
+    if not directory.exists():
 
-    for study in studies:
-        raw_candidates = []
-
-        # Files outside qc are considered Step02/raw candidate files.
-        if base.exists():
-            for p in base.rglob(f"*{study}*"):
-                if not p.is_file():
-                    continue
-                if "qc" in {x.lower() for x in p.parts}:
-                    continue
-                if p.suffix.lower() in {
-                    ".tsv", ".gz", ".txt", ".csv", ".parquet", ".bgz"
-                }:
-                    raw_candidates.append(p)
-
-        study_qc_dir = qc_root / study
-
-        rows.append({
-            "STUDY_ACCESSION": study,
-            "STEP01_DISCOVERED": True,
-            "STEP02_RAW_FILES": len(raw_candidates),
-            "STEP02_DOWNLOADED": len(raw_candidates) > 0 or study_qc_dir.exists(),
-            "STEP02_TOTAL_RAW_SIZE": (
-                human_size(sum(p.stat().st_size for p in raw_candidates))
-                if raw_candidates
-                else ""
-            ),
-        })
-
-    return pd.DataFrame(rows)
-
-
-# =============================================================================
-# STEP 03
-# =============================================================================
-
-def summarize_step03(
-    studies: list[str],
-    paths: dict[str, Path],
-):
-    rows = []
-    qc_root = paths["step02"] / "qc"
-
-    for study in studies:
-        d = qc_root / study
-
-        js = first_existing([
-            d / f"{study}_QC_summary.json",
-            d / "QC_summary.json",
-            d / "qc_summary.json",
-        ])
-
-        if js is None:
-            js = first_glob(d, ["*QC*summary*.json", "*summary*.json"])
-
-        data = safe_json(js) if js else {}
-
-        ts = first_existing([
-            d / f"{study}_QC_summary.tsv",
-            d / "QC_summary.tsv",
-            d / "qc_summary.tsv",
-        ])
-
-        if ts is None:
-            ts = first_glob(d, ["*QC*summary*.tsv", "*summary*.tsv"])
-
-        table = safe_tsv(ts) if ts else pd.DataFrame()
-
-        qc_file = first_existing([
-            d / f"{study}_GRCh38_QC.tsv.gz",
-            d / f"{study}_GRCh38_QC.tsv",
-        ])
-
-        sig_file = first_existing([
-            d / f"{study}_GRCh38_significant.tsv.gz",
-            d / f"{study}_GRCh38_significant.tsv",
-        ])
-
-        n_qc = json_value(
-            data,
-            [
-                "N_VARIANTS_AFTER_QC",
-                "N_AFTER_QC",
-                "N_QC_VARIANTS",
-                "N_VARIANTS_QC",
-            ],
-            default=df_value(
-                table,
-                [
-                    "N_VARIANTS_AFTER_QC",
-                    "N_AFTER_QC",
-                    "N_QC_VARIANTS",
-                ],
-            ),
-        )
-
-        n_sig = json_value(
-            data,
-            [
-                "N_GWS",
-                "N_GWS_QC",
-                "N_SIGNIFICANT",
-                "N_GENOME_WIDE_SIGNIFICANT",
-            ],
-            default=df_value(
-                table,
-                [
-                    "N_GWS",
-                    "N_GWS_QC",
-                    "N_SIGNIFICANT",
-                ],
-            ),
-        )
-
-        clump_ready = json_value(
-            data,
-            ["CLUMPING_READY", "CLUMP_READY"],
-            default=df_value(
-                table,
-                ["CLUMPING_READY", "CLUMP_READY"],
-                default="",
-            ),
-        )
-
-        susie_ready = json_value(
-            data,
-            ["SUSIE_READY", "FINE_MAPPING_READY"],
-            default=df_value(
-                table,
-                ["SUSIE_READY", "FINE_MAPPING_READY"],
-                default="",
-            ),
-        )
-
-        status = status_from_json(data)
-
-        if status == "MISSING" and output_exists(qc_file):
-            status = "OUTPUT_PRESENT"
-
-        rows.append({
-            "STUDY_ACCESSION": study,
-            "STEP03_STATUS": status,
-            "N_VARIANTS_AFTER_QC": integer(n_qc),
-            "N_GWS_QC": integer(n_sig),
-            "CLUMPING_READY": clump_ready,
-            "SUSIE_READY": susie_ready,
-            "QC_FILE": str(qc_file or ""),
-            "SIGNIFICANT_FILE": str(sig_file or ""),
-        })
-
-    return pd.DataFrame(rows)
-
-
-# =============================================================================
-# STEP 04
-# =============================================================================
-
-def summarize_step04(
-    root: Path,
-    ancestry_code: str,
-):
-    rows = []
-
-    base = root / "resources" / "1000G" / ancestry_code
-
-    for chrom in range(1, 23):
-        prefix = base / f"chr{chrom}_{ancestry_code}_GRCh38"
-
-        pgen = Path(str(prefix) + ".pgen")
-        pvar = Path(str(prefix) + ".pvar")
-        psam = Path(str(prefix) + ".psam")
-
-        complete = all(
-            p.exists() and p.stat().st_size > 0
-            for p in [pgen, pvar, psam]
-        )
-
-        rows.append({
-            "ANCESTRY": ancestry_code,
-            "CHR": chrom,
-            "PGEN": pgen.exists(),
-            "PVAR": pvar.exists(),
-            "PSAM": psam.exists(),
-            "COMPLETE": complete,
-        })
-
-    return pd.DataFrame(rows)
-
-
-# =============================================================================
-# STEP 05
-# =============================================================================
-
-def summarize_step05(
-    studies: list[str],
-    paths: dict[str, Path],
-):
-    rows = []
-    base = paths["step05"]
-
-    for study in studies:
-        d = base / study
-
-        js = first_existing([
-            d / "clumping_summary.json",
-            d / f"{study}_clumping_summary.json",
-        ])
-
-        if js is None:
-            js = first_glob(d, ["*clump*summary*.json", "*summary*.json"])
-
-        data = safe_json(js) if js else {}
-
-        ts = first_existing([
-            d / "clumping_summary.tsv",
-            d / f"{study}_clumping_summary.tsv",
-        ])
-
-        if ts is None:
-            ts = first_glob(d, ["*clump*summary*.tsv", "*summary*.tsv"])
-
-        table = safe_tsv(ts) if ts else pd.DataFrame()
-
-        lead = first_existing([
-            d / "lead_variants.tsv",
-            d / f"{study}_lead_variants.tsv",
-        ])
-
-        if lead is None:
-            lead = first_glob(d, ["*lead*variant*.tsv"])
-
-        mapped = first_existing([
-            d / "mapped_candidates.tsv.gz",
-            d / f"{study}_mapped_candidates.tsv.gz",
-        ])
-
-        if mapped is None:
-            mapped = first_glob(d, ["*mapped*candidate*.tsv*"])
-
-        n_leads = json_value(
-            data,
-            ["N_LEAD_VARIANTS", "N_LEADS", "N_INDEPENDENT_LEADS"],
-            default=df_value(
-                table,
-                ["N_LEAD_VARIANTS", "N_LEADS", "N_INDEPENDENT_LEADS"],
-            ),
-        )
-
-        if pd.isna(number(n_leads)) and lead:
-            lead_df = safe_tsv(lead)
-            n_leads = len(lead_df)
-
-        n_mapped = json_value(
-            data,
-            ["N_MAPPED_CANDIDATES", "N_MAPPED", "N_GWS_MAPPED"],
-            default=df_value(
-                table,
-                ["N_MAPPED_CANDIDATES", "N_MAPPED", "N_GWS_MAPPED"],
-            ),
-        )
-
-        if pd.isna(number(n_mapped)) and mapped:
-            mapped_df = safe_tsv(mapped)
-            n_mapped = len(mapped_df)
-
-        status = status_from_json(data)
-
-        if status == "MISSING" and d.exists():
-            status = "OUTPUT_PRESENT"
-
-        rows.append({
-            "STUDY_ACCESSION": study,
-            "STEP05_STATUS": status,
-            "N_MAPPED_CANDIDATES": integer(n_mapped),
-            "N_LEAD_VARIANTS": integer(n_leads),
-            "LEAD_FILE": str(lead or ""),
-        })
-
-    return pd.DataFrame(rows)
-
-
-# =============================================================================
-# STEP 06
-# =============================================================================
-
-def summarize_step06(
-    studies: list[str],
-    paths: dict[str, Path],
-):
-    rows = []
-    base = paths["step06"]
-
-    for study in studies:
-        d = base / study
-        js = d / "finemapping_summary.json"
-        data = safe_json(js)
-
-        variant_file = first_existing([
-            d / f"{study}_finemapped_variants.tsv.gz",
-            d / f"{study}_finemapped_variants.tsv",
-        ])
-
-        cs_file = first_existing([
-            d / f"{study}_95pct_credible_sets.tsv",
-            d / f"{study}_95pct_credible_sets.tsv.gz",
-        ])
-
-        n_rows = json_value(
-            data,
-            [
-                "N_FINEMAPPED_VARIANTS",
-                "N_FINEMAPPED_VARIANT_ROWS",
-                "N_VARIANTS",
-            ],
-        )
-
-        max_pip = json_value(
-            data,
-            ["MAX_PIP", "MAXIMUM_PIP"],
-        )
-
-        if variant_file and (
-            pd.isna(number(n_rows))
-            or pd.isna(number(max_pip))
-        ):
-            df = safe_tsv(
-                variant_file,
-                usecols=lambda c: c in {"PIP", "LOCUS_ID"},
-            )
-            if not df.empty:
-                if pd.isna(number(n_rows)):
-                    n_rows = len(df)
-                if "PIP" in df.columns and pd.isna(number(max_pip)):
-                    max_pip = pd.to_numeric(
-                        df["PIP"],
-                        errors="coerce",
-                    ).max()
-
-        n_cs = json_value(
-            data,
-            [
-                "N_CREDIBLE_SET_ROWS",
-                "N_95PCT_CREDIBLE_SET_ROWS",
-                "N_CS_ROWS",
-            ],
-        )
-
-        if cs_file and pd.isna(number(n_cs)):
-            cs = safe_tsv(cs_file)
-            n_cs = len(cs)
-
-        rows.append({
-            "STUDY_ACCESSION": study,
-            "STEP06_STATUS": status_from_json(data),
-            "N_LOCI_TOTAL": integer(
-                json_value(
-                    data,
-                    ["N_LOCI_TOTAL", "N_LOCI", "N_LOCI_ATTEMPTED"],
-                )
-            ),
-            "N_LOCI_SUCCESS": integer(
-                json_value(
-                    data,
-                    ["N_LOCI_SUCCESS", "N_LOCI_COMPLETED"],
-                )
-            ),
-            "N_LOCI_FAILED": integer(
-                json_value(
-                    data,
-                    ["N_LOCI_FAILED", "N_FAILED_LOCI"],
-                )
-            ),
-            "N_FINEMAPPED_VARIANTS": integer(n_rows),
-            "N_95PCT_CS_ROWS": integer(n_cs),
-            "MAX_PIP": number(max_pip),
-            "FINEMAPPED_FILE": str(variant_file or ""),
-        })
-
-    return pd.DataFrame(rows)
-
-
-# =============================================================================
-# STEP 07
-# =============================================================================
-
-def summarize_step07(
-    studies: list[str],
-    paths: dict[str, Path],
-):
-    rows = []
-    base = paths["step07"]
-
-    for study in studies:
-        d = base / study
-
-        summary_json = first_existing([
-            d / "annotation_summary.json",
-            d / "vep_summary.json",
-        ])
-
-        data = safe_json(summary_json) if summary_json else {}
-
-        variant_file = first_existing([
-            d / f"{study}_VEP_variant_summary.tsv",
-            d / f"{study}_VEP_variant_summary.tsv.gz",
-        ])
-
-        if variant_file is None:
-            variant_file = first_glob(d, ["*VEP*variant*summary*.tsv*"])
-
-        df = safe_tsv(variant_file) if variant_file else pd.DataFrame()
-
-        def category_count(name):
-            if "FUNCTIONAL_CATEGORY" not in df.columns:
-                return np.nan
-            return int(
-                (
-                    df["FUNCTIONAL_CATEGORY"]
-                    .fillna("")
-                    .astype(str)
-                    .str.upper()
-                    == name
-                ).sum()
-            )
-
-        n_selected = json_value(
-            data,
-            ["N_SELECTED_VARIANTS", "N_INPUT_VARIANTS"],
-            default=(len(df) if not df.empty else np.nan),
-        )
-
-        n_annotated = json_value(
-            data,
-            ["N_ANNOTATED_VARIANTS", "N_VEP_ANNOTATED"],
-            default=(
-                int(df["VEP_ID"].notna().sum())
-                if "VEP_ID" in df.columns
-                else len(df) if not df.empty else np.nan
-            ),
-        )
-
-        status = status_from_json(data)
-
-        if status == "MISSING" and variant_file:
-            status = "COMPLETE"
-
-        rows.append({
-            "STUDY_ACCESSION": study,
-            "STEP07_STATUS": status,
-            "N_SELECTED_VARIANTS": integer(n_selected),
-            "N_ANNOTATED_VARIANTS": integer(n_annotated),
-            "N_SPLICING": integer(
-                json_value(data, ["N_SPLICING"], default=category_count("SPLICING"))
-            ),
-            "N_CODING": integer(
-                json_value(data, ["N_CODING"], default=category_count("CODING"))
-            ),
-            "N_REGULATORY": integer(
-                json_value(data, ["N_REGULATORY"], default=category_count("REGULATORY"))
-            ),
-            "N_NONCODING_RNA": integer(
-                json_value(data, ["N_NONCODING_RNA"], default=category_count("NONCODING_RNA"))
-            ),
-            "VEP_FILE": str(variant_file or ""),
-        })
-
-    return pd.DataFrame(rows)
-
-
-# =============================================================================
-# STEP 08
-# =============================================================================
-
-def summarize_step08(
-    studies: list[str],
-    paths: dict[str, Path],
-):
-    rows = []
-    base = paths["step08"]
-
-    for study in studies:
-        d = base / study
-        js = d / "qtl_summary.json"
-        data = safe_json(js)
-
-        variant_file = first_existing([
-            d / f"{study}_GTEx_QTL_variant_summary.tsv",
-            d / f"{study}_GTEx_QTL_variant_summary.tsv.gz",
-        ])
-
-        df = safe_tsv(variant_file) if variant_file else pd.DataFrame()
-
-        def bool_count(col):
-            if col not in df.columns:
-                return np.nan
-            x = (
-                df[col]
-                .fillna(False)
-                .astype(str)
-                .str.lower()
-                .isin({"true", "1", "yes", "y"})
-            )
-            return int(x.sum())
-
-        n_input = json_value(
-            data,
-            ["N_INPUT_VARIANTS", "N_VARIANTS"],
-            default=(len(df) if not df.empty else np.nan),
-        )
-
-        n_eqtl = json_value(
-            data,
-            ["N_EQTL_VARIANTS", "N_GTEX_EQTL_VARIANTS"],
-            default=bool_count("HAS_GTEX_EQTL"),
-        )
-
-        n_sqtl = json_value(
-            data,
-            ["N_SQTL_VARIANTS", "N_GTEX_SQTL_VARIANTS"],
-            default=bool_count("HAS_GTEX_SQTL"),
-        )
-
-        n_both = json_value(
-            data,
-            ["N_EQTL_AND_SQTL", "N_GTEX_EQTL_AND_SQTL"],
-            default=bool_count("HAS_GTEX_EQTL_AND_SQTL"),
-        )
-
-        status = status_from_json(data)
-
-        if status == "MISSING" and variant_file:
-            status = "COMPLETE"
-
-        rows.append({
-            "STUDY_ACCESSION": study,
-            "STEP08_STATUS": status,
-            "N_INPUT_VARIANTS": integer(n_input),
-            "N_EQTL_VARIANTS": integer(n_eqtl),
-            "N_SQTL_VARIANTS": integer(n_sqtl),
-            "N_EQTL_AND_SQTL": integer(n_both),
-            "N_EQTL_ASSOCIATIONS": integer(
-                json_value(
-                    data,
-                    ["N_EQTL_ASSOCIATIONS", "N_GTEX_EQTL_ASSOCIATIONS"],
-                )
-            ),
-            "N_SQTL_ASSOCIATIONS": integer(
-                json_value(
-                    data,
-                    ["N_SQTL_ASSOCIATIONS", "N_GTEX_SQTL_ASSOCIATIONS"],
-                )
-            ),
-            "N_EQTL_TISSUES": integer(
-                json_value(
-                    data,
-                    ["N_EQTL_TISSUES", "N_GTEX_EQTL_TISSUES"],
-                )
-            ),
-            "N_SQTL_TISSUES": integer(
-                json_value(
-                    data,
-                    ["N_SQTL_TISSUES", "N_GTEX_SQTL_TISSUES"],
-                )
-            ),
-            "QTL_FILE": str(variant_file or ""),
-        })
-
-    return pd.DataFrame(rows)
-
-
-# =============================================================================
-# STEP 09
-# =============================================================================
-
-def summarize_step09(
-    studies: list[str],
-    paths: dict[str, Path],
-):
-    rows = []
-    base = paths["step09"]
-
-    for study in studies:
-        d = base / study
-        data = safe_json(d / "spliceai_summary.json")
-
-        variant_file = first_existing([
-            d / f"{study}_SpliceAI_variant_summary.tsv",
-            d / f"{study}_SpliceAI_variant_summary.tsv.gz",
-        ])
-
-        df = safe_tsv(variant_file) if variant_file else pd.DataFrame()
-
-        def threshold_count(thresh):
-            if "SPLICEAI_MAX_DS" not in df.columns:
-                return np.nan
-            x = pd.to_numeric(df["SPLICEAI_MAX_DS"], errors="coerce")
-            return int((x >= thresh).sum())
-
-        n_scored = json_value(
-            data,
-            ["N_SPLICEAI_SCORED", "N_SCORED_VARIANTS"],
-            default=(
-                int(pd.to_numeric(
-                    df["SPLICEAI_MAX_DS"],
-                    errors="coerce",
-                ).notna().sum())
-                if "SPLICEAI_MAX_DS" in df.columns
-                else np.nan
-            ),
-        )
-
-        status = status_from_json(data)
-
-        if status == "MISSING" and variant_file:
-            status = "COMPLETE"
-
-        rows.append({
-            "STUDY_ACCESSION": study,
-            "STEP09_STATUS": status,
-            "N_INPUT_VARIANTS": integer(
-                json_value(
-                    data,
-                    ["N_INPUT_VARIANTS", "N_TOTAL_VARIANTS"],
-                    default=(len(df) if not df.empty else np.nan),
-                )
-            ),
-            "N_SPLICEAI_SCORED": integer(n_scored),
-            "N_SPLICEAI_GE_0_20": integer(
-                json_value(
-                    data,
-                    ["N_SPLICEAI_GE_0_20"],
-                    default=threshold_count(0.20),
-                )
-            ),
-            "N_SPLICEAI_GE_0_50": integer(
-                json_value(
-                    data,
-                    ["N_SPLICEAI_GE_0_50"],
-                    default=threshold_count(0.50),
-                )
-            ),
-            "N_SPLICEAI_GE_0_80": integer(
-                json_value(
-                    data,
-                    ["N_SPLICEAI_GE_0_80"],
-                    default=threshold_count(0.80),
-                )
-            ),
-            "SPLICEAI_FILE": str(variant_file or ""),
-        })
-
-    return pd.DataFrame(rows)
-
-
-# =============================================================================
-# STEP 10
-# =============================================================================
-
-def summarize_step10(
-    studies: list[str],
-    paths: dict[str, Path],
-):
-    rows = []
-    base = paths["step10"]
-
-    for study in studies:
-        d = base / study
-        data = safe_json(d / "pangolin_summary.json")
-
-        integrated = first_existing([
-            d / f"{study}_SpliceAI_Pangolin_integrated.tsv",
-        ])
-
-        status = status_from_json(data)
-
-        if status == "MISSING" and integrated:
-            status = "COMPLETE"
-
-        rows.append({
-            "STUDY_ACCESSION": study,
-            "STEP10_STATUS": status,
-            "N_INPUT_VARIANTS": integer(
-                json_value(data, ["N_INPUT_VARIANTS"])
-            ),
-            "N_PANGOLIN_SCORED": integer(
-                json_value(data, ["N_PANGOLIN_SCORED"])
-            ),
-            "N_PANGOLIN_UNSCORED": integer(
-                json_value(data, ["N_PANGOLIN_UNSCORED"])
-            ),
-            "PANGOLIN_COVERAGE_PERCENT": number(
-                json_value(data, ["PANGOLIN_COVERAGE_PERCENT"])
-            ),
-            "N_PANGOLIN_TOP_10PCT": integer(
-                json_value(data, ["N_PANGOLIN_TOP_10PCT"])
-            ),
-            "N_PANGOLIN_TOP_5PCT": integer(
-                json_value(data, ["N_PANGOLIN_TOP_5PCT"])
-            ),
-            "N_PANGOLIN_TOP_1PCT": integer(
-                json_value(data, ["N_PANGOLIN_TOP_1PCT"])
-            ),
-            "N_MULTI_SOURCE_GE_2": integer(
-                json_value(data, ["N_MULTI_SOURCE_GE_2"])
-            ),
-            "PANGOLIN_FILE": str(integrated or ""),
-        })
-
-    return pd.DataFrame(rows)
-
-
-# =============================================================================
-# STEP 11
-# =============================================================================
-
-def summarize_step11(
-    studies: list[str],
-    paths: dict[str, Path],
-):
-    rows = []
-    base = paths["step11"]
-
-    for study in studies:
-        d = base / study
-        data = safe_json(d / "coloc_summary.json")
-
-        pair_file = first_existing([
-            d / f"{study}_GTEx_SuSiE_gene_tissue_colocalization.tsv",
-        ])
-
-        status = status_from_json(data)
-
-        if status == "MISSING" and pair_file:
-            status = "COMPLETE"
-
-        rows.append({
-            "STUDY_ACCESSION": study,
-            "STEP11_STATUS": status,
-            "N_GWAS_FINE_MAPPED_VARIANTS": integer(
-                json_value(data, ["N_GWAS_FINE_MAPPED_VARIANTS"])
-            ),
-            "N_GWAS_LOCI": integer(
-                json_value(data, ["N_GWAS_LOCI"])
-            ),
-            "N_VARIANT_OVERLAP_ROWS": integer(
-                json_value(data, ["N_VARIANT_OVERLAP_ROWS"])
-            ),
-            "N_UNIQUE_SHARED_VARIANTS": integer(
-                json_value(data, ["N_UNIQUE_SHARED_VARIANTS"])
-            ),
-            "N_COLOC_LOCI": integer(
-                json_value(data, ["N_COLOC_LOCI"])
-            ),
-            "N_GENE_TISSUE_PAIRS": integer(
-                json_value(data, ["N_GENE_TISSUE_PAIRS"])
-            ),
-            "N_GENES": integer(
-                json_value(data, ["N_GENES"])
-            ),
-            "N_TISSUES": integer(
-                json_value(data, ["N_TISSUES"])
-            ),
-            "N_LCLPP_GE_0_01": integer(
-                json_value(data, ["N_PAIR_LCLPP_GE_0_01"])
-            ),
-            "N_LCLPP_GE_0_001": integer(
-                json_value(data, ["N_PAIR_LCLPP_GE_0_001"])
-            ),
-            "MAX_LCLPP": number(
-                json_value(data, ["MAX_LCLPP"])
-            ),
-            "COLOC_FILE": str(pair_file or ""),
-        })
-
-    return pd.DataFrame(rows)
-
-
-# =============================================================================
-# EXCLUSIONS
-# =============================================================================
-
-def collect_exclusions(paths: dict[str, Path]) -> pd.DataFrame:
-    pieces = []
-
-    for step_key, base in paths.items():
-        if not base.exists():
-            continue
-
-        for path in sorted(base.glob("*excluded*.tsv")):
-            df = safe_tsv(path, dtype=str)
-
-            if df.empty:
-                continue
-
-            df = df.copy()
-            df.insert(0, "STEP", step_key.upper())
-            df.insert(1, "SOURCE_FILE", str(path))
-            pieces.append(df)
-
-    if not pieces:
-        return pd.DataFrame(
-            columns=[
-                "STEP",
-                "STUDY_ACCESSION",
-                "REASON",
-                "SOURCE_FILE",
-            ]
-        )
-
-    out = pd.concat(
-        pieces,
-        ignore_index=True,
-        sort=False,
-    )
-
-    # normalize study column
-    study_col = first_present(
-        out.columns,
-        ["STUDY_ACCESSION", "ACCESSION", "GCST"],
-    )
-
-    if study_col and study_col != "STUDY_ACCESSION":
-        out["STUDY_ACCESSION"] = out[study_col]
-
-    reason_col = first_present(
-        out.columns,
-        ["REASON", "EXCLUSION_REASON", "STATUS"],
-    )
-
-    if reason_col and reason_col != "REASON":
-        out["REASON"] = out[reason_col]
-
-    preferred = [
-        c
-        for c in [
-            "STEP",
-            "STUDY_ACCESSION",
-            "REASON",
-            "SOURCE_FILE",
-        ]
-        if c in out.columns
-    ]
-
-    others = [
-        c for c in out.columns
-        if c not in preferred
-    ]
-
-    return out[preferred + others]
-
-
-# =============================================================================
-# WARNINGS / ERRORS
-# =============================================================================
-
-WARNING_PATTERNS = [
-    re.compile(r"\bwarning\b", re.I),
-    re.compile(r"\berror\b", re.I),
-    re.compile(r"\bfailed\b", re.I),
-    re.compile(r"\bskipping variant\b", re.I),
-]
-
-
-def scan_warning_file(path: Path) -> dict | None:
-    if not path.exists() or not path.is_file():
         return None
 
-    # Avoid accidentally reading enormous binary or data files.
-    if path.stat().st_size > 200 * 1024 * 1024:
-        return None
+    for pattern in patterns:
 
-    count_warning = 0
-    count_error = 0
-    count_skip = 0
-    examples = []
+        if "*" in pattern:
+
+            hits = sorted(
+
+                path
+
+                for path
+                in directory.glob(
+                    pattern
+                )
+
+                if (
+                    path.is_file()
+                    and
+                    path.stat().st_size
+                    >
+                    0
+                )
+            )
+
+            if hits:
+
+                return hits[
+                    0
+                ]
+
+        else:
+
+            path = (
+                directory
+                /
+                pattern
+            )
+
+            if (
+                path.exists()
+                and
+                path.is_file()
+                and
+                path.stat().st_size
+                >
+                0
+            ):
+
+                return path
+
+    return None
+
+
+def safe_json(
+    path,
+):
+
+    if path is None:
+
+        return {}
 
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as handle:
-            for line in handle:
-                low = line.lower()
 
-                if "warning" in low:
-                    count_warning += 1
+        return json.loads(
 
-                if "error" in low or "failed" in low:
-                    count_error += 1
+            path.read_text(
 
-                if "skipping variant" in low:
-                    count_skip += 1
+                encoding="utf-8",
 
-                if any(p.search(line) for p in WARNING_PATTERNS):
-                    if len(examples) < 3:
-                        examples.append(line.strip()[:220])
+                errors="replace",
+            )
+        )
 
     except Exception:
-        return None
 
-    if count_warning == 0 and count_error == 0 and count_skip == 0:
-        return None
+        return {}
 
-    m = re.search(r"(GCST\d+)", str(path))
+
+def pick(
+    data,
+    *keys,
+    default=np.nan,
+):
+
+    for key in keys:
+
+        if (
+            key in data
+            and
+            data[
+                key
+            ]
+            not in
+            (
+                None,
+                "",
+            )
+        ):
+
+            return data[
+                key
+            ]
+
+    return default
+
+
+def nint(
+    value,
+):
+
+    try:
+
+        return int(
+            float(
+                value
+            )
+        )
+
+    except Exception:
+
+        return np.nan
+
+
+def nfloat(
+    value,
+):
+
+    try:
+
+        return float(
+            value
+        )
+
+    except Exception:
+
+        return np.nan
+
+
+# =============================================================================
+# FAST POLARS FILE READER
+# =============================================================================
+
+def read_pl(
+    path,
+):
+
+    if path is None:
+
+        return pl.DataFrame()
+
+    try:
+
+        return pl.read_csv(
+
+            path,
+
+            separator="\t",
+
+            infer_schema_length=2000,
+
+            ignore_errors=True,
+
+            null_values=[
+
+                "NA",
+
+                "NaN",
+
+                "nan",
+
+                "None",
+
+                "",
+            ],
+        )
+
+    except Exception as error:
+
+        print(
+
+            f"[WARN] "
+            f"{path}: "
+            f"{type(error).__name__}: "
+            f"{error}"
+        )
+
+        return pl.DataFrame()
+
+
+# =============================================================================
+# PROJECT PATHS
+# =============================================================================
+
+def roots_for(
+    root,
+    phenotype,
+    ancestry_label,
+):
+
+    phenotype_slug = slug(
+        phenotype
+    )
+
+    ancestry_slug = slug(
+        ancestry_label
+    )
 
     return {
-        "STUDY_ACCESSION": m.group(1) if m else "",
-        "FILE": str(path),
-        "N_WARNING_LINES": count_warning,
-        "N_ERROR_OR_FAILED_LINES": count_error,
-        "N_SKIPPING_VARIANT_LINES": count_skip,
-        "EXAMPLES": " || ".join(examples),
+
+        "S02":
+            root
+            /
+            "02_summary_stats"
+            /
+            phenotype_slug
+            /
+            ancestry_slug,
+
+        "S05":
+            root
+            /
+            "05_ld_clumping"
+            /
+            phenotype_slug
+            /
+            ancestry_slug,
+
+        "S06":
+            root
+            /
+            "06_finemapping"
+            /
+            phenotype_slug
+            /
+            ancestry_slug,
+
+        "S07":
+            root
+            /
+            "07_annotation"
+            /
+            phenotype_slug
+            /
+            ancestry_slug,
+
+        "S08":
+            root
+            /
+            "08_qtl"
+            /
+            phenotype_slug
+            /
+            ancestry_slug,
+
+        "S09":
+            root
+            /
+            "09_splicing"
+            /
+            phenotype_slug
+            /
+            ancestry_slug,
+
+        "S10":
+            root
+            /
+            "10_pangolin"
+            /
+            phenotype_slug
+            /
+            ancestry_slug,
+
+        "S11":
+            root
+            /
+            "11_coloc"
+            /
+            phenotype_slug
+            /
+            ancestry_slug,
     }
 
 
-def collect_warnings(
-    root: Path,
-    paths: dict[str, Path],
-) -> pd.DataFrame:
+def discover_studies(
+    roots,
+):
 
-    candidates = set()
+    studies = set()
 
-    for base in paths.values():
+    bases = [
+
+        roots[
+            "S02"
+        ]
+        /
+        "qc",
+
+        roots[
+            "S05"
+        ],
+
+        roots[
+            "S06"
+        ],
+
+        roots[
+            "S07"
+        ],
+
+        roots[
+            "S08"
+        ],
+
+        roots[
+            "S09"
+        ],
+
+        roots[
+            "S10"
+        ],
+
+        roots[
+            "S11"
+        ],
+    ]
+
+    for base in bases:
+
         if not base.exists():
+
             continue
 
-        for pattern in [
-            "**/*.log",
-            "**/*FAILED*.txt",
-            "**/*.err",
-        ]:
-            candidates.update(
-                p.resolve()
-                for p in base.glob(pattern)
-                if p.is_file()
-            )
+        for directory in base.glob(
+            "GCST*"
+        ):
 
-    logs_root = root / "logs"
-
-    if logs_root.exists():
-        for p in logs_root.rglob("*"):
             if (
-                p.is_file()
-                and p.suffix.lower() in {".log", ".err", ".out", ".txt"}
+                directory.is_dir()
+                and
+                re.fullmatch(
+                    r"GCST\d+",
+                    directory.name,
+                )
             ):
-                if any(
-                    token in str(p).lower()
-                    for token in [
-                        "step07",
-                        "step08",
-                        "step09",
-                        "step10",
-                        "step11",
-                        "vep",
-                        "splice",
-                        "pangolin",
-                        "coloc",
-                    ]
-                ):
-                    candidates.add(p.resolve())
 
-    rows = []
+                studies.add(
+                    directory.name
+                )
 
-    for path in sorted(candidates):
-        row = scan_warning_file(path)
-        if row:
-            rows.append(row)
+    return sorted(
+        studies
+    )
 
-    if not rows:
-        return pd.DataFrame(
-            columns=[
-                "STUDY_ACCESSION",
-                "FILE",
-                "N_WARNING_LINES",
-                "N_ERROR_OR_FAILED_LINES",
-                "N_SKIPPING_VARIANT_LINES",
-                "EXAMPLES",
+
+def study_paths(
+    roots,
+    study,
+):
+
+    return {
+
+        "S03":
+            roots[
+                "S02"
             ]
-        )
+            /
+            "qc"
+            /
+            study,
 
-    return (
-        pd.DataFrame(rows)
-        .sort_values(
-            [
-                "N_ERROR_OR_FAILED_LINES",
-                "N_WARNING_LINES",
-                "N_SKIPPING_VARIANT_LINES",
-            ],
-            ascending=False,
+        "S05":
+            roots[
+                "S05"
+            ]
+            /
+            study,
+
+        "S06":
+            roots[
+                "S06"
+            ]
+            /
+            study,
+
+        "S07":
+            roots[
+                "S07"
+            ]
+            /
+            study,
+
+        "S08":
+            roots[
+                "S08"
+            ]
+            /
+            study,
+
+        "S09":
+            roots[
+                "S09"
+            ]
+            /
+            study,
+
+        "S10":
+            roots[
+                "S10"
+            ]
+            /
+            study,
+
+        "S11":
+            roots[
+                "S11"
+            ]
+            /
+            study,
+    }
+
+
+def load_summary(
+    directory,
+    names,
+):
+
+    return safe_json(
+
+        first_file(
+            directory,
+            names,
         )
-        .reset_index(drop=True)
     )
 
 
 # =============================================================================
-# CROSS-GWAS COMMON FINE-MAPPED VARIANTS
+# TABLE 1
+# PIPELINE AUDIT
 # =============================================================================
 
-def common_finemapped_variants(
-    studies: list[str],
-    paths: dict[str, Path],
-    min_pip: float,
-) -> pd.DataFrame:
+def pipeline_row(
+    study,
+    sp,
+):
 
-    pieces = []
+    qc = load_summary(
 
-    for study in studies:
-        path = first_existing([
-            paths["step06"]
-            / study
-            / f"{study}_finemapped_variants.tsv.gz",
+        sp[
+            "S03"
+        ],
 
-            paths["step06"]
-            / study
-            / f"{study}_finemapped_variants.tsv",
-        ])
+        [
+            f"{study}_QC_summary.json",
+            "*QC_summary.json",
+        ],
+    )
 
-        if not path:
-            continue
+    clumping = load_summary(
 
-        df = safe_tsv(
-            path,
-            usecols=lambda c: c in {
-                "CHR",
-                "REFERENCE_POS",
-                "REFERENCE_REF",
-                "REFERENCE_ALT",
-                "PIP",
-                "LOCUS_ID",
-            },
-        )
+        sp[
+            "S05"
+        ],
 
-        required = {
+        [
+            f"{study}_clumping_summary.json",
+            "clumping_summary.json",
+            "*clumping_summary.json",
+        ],
+    )
+
+    finemap = load_summary(
+
+        sp[
+            "S06"
+        ],
+
+        [
+            "finemapping_summary.json",
+        ],
+    )
+
+    vep = load_summary(
+
+        sp[
+            "S07"
+        ],
+
+        [
+            "annotation_summary.json",
+            "vep_summary.json",
+        ],
+    )
+
+    qtl = load_summary(
+
+        sp[
+            "S08"
+        ],
+
+        [
+            "qtl_summary.json",
+        ],
+    )
+
+    spliceai = load_summary(
+
+        sp[
+            "S09"
+        ],
+
+        [
+            "spliceai_summary.json",
+        ],
+    )
+
+    pangolin = load_summary(
+
+        sp[
+            "S10"
+        ],
+
+        [
+            "pangolin_summary.json",
+        ],
+    )
+
+    coloc = load_summary(
+
+        sp[
+            "S11"
+        ],
+
+        [
+            "coloc_summary.json",
+        ],
+    )
+
+    return {
+
+        "STUDY":
+            study,
+
+        "QC":
+            pick(
+                qc,
+                "QC_STATUS",
+                "STATUS",
+                default=(
+                    "MISSING"
+                    if not qc
+                    else
+                    "PRESENT"
+                ),
+            ),
+
+        "N_AFTER_QC":
+            nint(
+                pick(
+                    qc,
+                    "N_AFTER_QC",
+                    "N_VARIANTS_AFTER_QC",
+                )
+            ),
+
+        "N_GWS":
+            nint(
+                pick(
+                    qc,
+                    "N_GENOME_WIDE_SIGNIFICANT",
+                    "N_GWS_QC",
+                    "N_GWS",
+                )
+            ),
+
+        "N_LEADS":
+            nint(
+                pick(
+                    clumping,
+                    "N_LEAD_VARIANTS",
+                )
+            ),
+
+        "N_LOCI_OK":
+            nint(
+                pick(
+                    finemap,
+                    "N_LOCI_SUCCESS",
+                )
+            ),
+
+        "VEP_SELECTED":
+            nint(
+                pick(
+                    vep,
+                    "N_SELECTED_VARIANTS",
+                )
+            ),
+
+        "EQTL_VARIANTS":
+            nint(
+                pick(
+                    qtl,
+                    "N_EQTL_VARIANTS",
+                )
+            ),
+
+        "SQTL_VARIANTS":
+            nint(
+                pick(
+                    qtl,
+                    "N_SQTL_VARIANTS",
+                )
+            ),
+
+        "SPLICEAI_STATUS":
+            pick(
+                spliceai,
+                "STATUS",
+                default=(
+                    "MISSING"
+                    if not spliceai
+                    else
+                    "PRESENT"
+                ),
+            ),
+
+        "SPLICEAI_SCORED":
+            nint(
+                pick(
+                    spliceai,
+                    "N_SPLICEAI_SCORED_VARIANTS",
+                    "N_SPLICEAI_SCORED",
+                )
+            ),
+
+        "SPLICEAI_GE_020":
+            nint(
+                pick(
+                    spliceai,
+                    "N_SPLICEAI_GE_0_20",
+                )
+            ),
+
+        "PANGOLIN_STATUS":
+            pick(
+                pangolin,
+                "STATUS",
+                default=(
+                    "MISSING"
+                    if not pangolin
+                    else
+                    "PRESENT"
+                ),
+            ),
+
+        "PANGOLIN_SCORED":
+            nint(
+                pick(
+                    pangolin,
+                    "N_PANGOLIN_SCORED",
+                )
+            ),
+
+        "PANGOLIN_TOP5":
+            nint(
+                pick(
+                    pangolin,
+                    "N_PANGOLIN_TOP_5PCT",
+                )
+            ),
+
+        "MULTISOURCE_SPLICE":
+            nint(
+                pick(
+                    pangolin,
+                    "N_MULTI_SOURCE_GE_2",
+                )
+            ),
+
+        "COLOC_STATUS":
+            pick(
+                coloc,
+                "STATUS",
+                default=(
+                    "MISSING"
+                    if not coloc
+                    else
+                    "PRESENT"
+                ),
+            ),
+
+        "SHARED_VARIANTS":
+            nint(
+                pick(
+                    coloc,
+                    "N_UNIQUE_SHARED_VARIANTS",
+                )
+            ),
+
+        "COLOC_LOCI":
+            nint(
+                pick(
+                    coloc,
+                    "N_COLOC_LOCI",
+                )
+            ),
+
+        "COLOC_GENES":
+            nint(
+                pick(
+                    coloc,
+                    "N_GENES",
+                )
+            ),
+
+        "BEST_LCLPP":
+            nfloat(
+                pick(
+                    coloc,
+                    "MAX_LCLPP",
+                )
+            ),
+
+        "PAIR_LCLPP_GE_001":
+            nint(
+                pick(
+                    coloc,
+                    "N_PAIR_LCLPP_GE_0_01",
+                )
+            ),
+    }
+
+
+# =============================================================================
+# STEP 06 LOCUS DEFINITIONS
+# =============================================================================
+
+def loci_definition(
+    sp,
+    study,
+):
+
+    path = first_file(
+
+        sp[
+            "S06"
+        ],
+
+        [
+            "loci_definition.tsv",
+        ],
+    )
+
+    table = read_pl(
+        path
+    )
+
+    if (
+        table.height
+        ==
+        0
+        or
+        "LOCUS_ID"
+        not in table.columns
+    ):
+
+        return pd.DataFrame()
+
+    columns = [
+
+        column
+
+        for column
+        in [
+
+            "LOCUS_ID",
+
             "CHR",
-            "REFERENCE_POS",
-            "REFERENCE_REF",
-            "REFERENCE_ALT",
-            "PIP",
-        }
 
-        if not required.issubset(df.columns):
-            continue
+            "LOCUS_START",
 
-        df = df.copy()
+            "LOCUS_END",
 
-        df["PIP"] = pd.to_numeric(
-            df["PIP"],
-            errors="coerce",
-        )
+            "N_INDEPENDENT_SIGNALS",
 
-        df = df[
-            df["PIP"] >= min_pip
-        ].copy()
+            "LEAD_IDS",
 
-        if df.empty:
-            continue
+            "LEAD_POSITIONS",
 
-        df["VARIANT_KEY"] = [
-            variant_key(c, p, r, a)
-            for c, p, r, a in zip(
-                df["CHR"],
-                df["REFERENCE_POS"],
-                df["REFERENCE_REF"],
-                df["REFERENCE_ALT"],
-            )
+            "MIN_LEAD_P",
+
         ]
 
-        df = df.dropna(
-            subset=["VARIANT_KEY"]
-        )
-
-        df["STUDY_ACCESSION"] = study
-
-        pieces.append(
-            df[
-                [
-                    "STUDY_ACCESSION",
-                    "VARIANT_KEY",
-                    "PIP",
-                ]
-            ]
-        )
-
-    if not pieces:
-        return pd.DataFrame(
-            columns=[
-                "VARIANT_KEY",
-                "N_STUDIES",
-                "MAX_PIP",
-                "MEAN_PIP",
-                "STUDIES",
-            ]
-        )
-
-    x = pd.concat(
-        pieces,
-        ignore_index=True,
-    )
-
-    out = (
-        x.groupby(
-            "VARIANT_KEY",
-            as_index=False,
-        )
-        .agg(
-            N_STUDIES=("STUDY_ACCESSION", "nunique"),
-            MAX_PIP=("PIP", "max"),
-            MEAN_PIP=("PIP", "mean"),
-            STUDIES=(
-                "STUDY_ACCESSION",
-                lambda s: ";".join(sorted(set(map(str, s)))),
-            ),
-        )
-    )
-
-    return (
-        out[
-            out["N_STUDIES"] >= 2
-        ]
-        .sort_values(
-            [
-                "N_STUDIES",
-                "MAX_PIP",
-                "MEAN_PIP",
-            ],
-            ascending=False,
-        )
-        .reset_index(drop=True)
-    )
-
-
-# =============================================================================
-# COMMON VEP GENES
-# =============================================================================
-
-def split_genes(value):
-    if pd.isna(value):
-        return []
-
-    text = str(value).strip()
-
-    if not text or text.lower() in {"nan", "none", "."}:
-        return []
-
-    genes = re.split(r"[;,|]", text)
-
-    return [
-        g.strip()
-        for g in genes
-        if g.strip()
-        and g.strip().lower() not in {"nan", "none", "."}
+        if column
+        in table.columns
     ]
 
+    output = (
 
-def common_vep_genes(
-    studies: list[str],
-    paths: dict[str, Path],
-) -> pd.DataFrame:
-
-    rows = []
-
-    for study in studies:
-        d = paths["step07"] / study
-
-        path = first_existing([
-            d / f"{study}_VEP_variant_summary.tsv",
-            d / f"{study}_VEP_variant_summary.tsv.gz",
-        ])
-
-        if path is None:
-            path = first_glob(
-                d,
-                ["*VEP*variant*summary*.tsv*"],
-            )
-
-        if not path:
-            continue
-
-        df = safe_tsv(path)
-
-        gene_col = first_present(
-            df.columns,
-            [
-                "SYMBOL",
-                "GENE_SYMBOL",
-                "GENE",
-                "Gene",
-                "VEP_SYMBOL",
-                "NEAREST_GENE",
-            ],
+        table
+        .select(
+            columns
         )
-
-        if gene_col is None:
-            continue
-
-        pip_col = first_present(
-            df.columns,
-            ["PIP"],
-        )
-
-        for _, row in df.iterrows():
-            genes = split_genes(
-                row[gene_col]
-            )
-
-            pip = (
-                number(row[pip_col])
-                if pip_col
-                else np.nan
-            )
-
-            for gene in genes:
-                rows.append({
-                    "STUDY_ACCESSION": study,
-                    "GENE": gene,
-                    "PIP": pip,
-                })
-
-    if not rows:
-        return pd.DataFrame(
-            columns=[
-                "GENE",
-                "N_STUDIES",
-                "MAX_PIP",
-                "STUDIES",
-            ]
-        )
-
-    x = pd.DataFrame(rows)
-
-    out = (
-        x.groupby(
-            "GENE",
-            as_index=False,
-        )
-        .agg(
-            N_STUDIES=("STUDY_ACCESSION", "nunique"),
-            MAX_PIP=("PIP", "max"),
-            STUDIES=(
-                "STUDY_ACCESSION",
-                lambda s: ";".join(sorted(set(map(str, s)))),
-            ),
-        )
+        .to_pandas()
     )
+
+    output[
+        "STUDY"
+    ] = study
+
+    for column in [
+
+        "CHR",
+
+        "LOCUS_START",
+
+        "LOCUS_END",
+
+    ]:
+
+        if column in output.columns:
+
+            output[
+                column
+            ] = pd.to_numeric(
+
+                output[
+                    column
+                ],
+
+                errors="coerce",
+            )
+
+    return output
+
+
+# =============================================================================
+# STEP 06 CREDIBLE SET SUMMARY
+# =============================================================================
+
+def cs_summary(
+    sp,
+):
+
+    path = first_file(
+
+        sp[
+            "S06"
+        ],
+
+        [
+            "*_95pct_credible_sets.tsv",
+            "*_95pct_credible_sets.tsv.gz",
+        ],
+    )
+
+    table = read_pl(
+        path
+    )
+
+    if (
+        table.height
+        ==
+        0
+        or
+        "LOCUS_ID"
+        not in table.columns
+    ):
+
+        return pd.DataFrame()
+
+    if "PIP" in table.columns:
+
+        table = table.with_columns(
+
+            pl.col(
+                "PIP"
+            )
+            .cast(
+                pl.Float64,
+                strict=False,
+            )
+        )
+
+    aggregations = [
+
+        pl.len()
+        .alias(
+            "CS95_N"
+        )
+    ]
+
+    if "PIP" in table.columns:
+
+        aggregations += [
+
+            pl.col(
+                "PIP"
+            )
+            .max()
+            .alias(
+                "CS95_MAX_PIP"
+            ),
+
+            (
+                pl.col(
+                    "PIP"
+                )
+                >=
+                0.10
+            )
+            .sum()
+            .alias(
+                "CS95_PIP_GE_010"
+            ),
+
+            (
+                pl.col(
+                    "PIP"
+                )
+                >=
+                0.50
+            )
+            .sum()
+            .alias(
+                "CS95_PIP_GE_050"
+            ),
+        ]
 
     return (
-        out[
-            out["N_STUDIES"] >= 2
-        ]
-        .sort_values(
-            [
-                "N_STUDIES",
-                "MAX_PIP",
-                "GENE",
-            ],
-            ascending=[
-                False,
-                False,
-                True,
-            ],
+
+        table
+        .group_by(
+            "LOCUS_ID"
         )
-        .reset_index(drop=True)
+        .agg(
+            aggregations
+        )
+        .to_pandas()
     )
 
 
 # =============================================================================
-# COMMON COLOCALIZED GENES + TISSUES
+# STEP 07 FUNCTIONAL CONTEXT
 # =============================================================================
 
-def common_coloc(
-    studies: list[str],
-    paths: dict[str, Path],
+def vep_summary(
+    sp,
 ):
-    pieces = []
 
-    for study in studies:
-        path = (
-            paths["step11"]
-            / study
-            / f"{study}_GTEx_SuSiE_gene_tissue_colocalization.tsv"
+    path = first_file(
+
+        sp[
+            "S07"
+        ],
+
+        [
+            "*_VEP_variant_summary.tsv",
+            "*_VEP_variant_summary.tsv.gz",
+        ],
+    )
+
+    table = read_pl(
+        path
+    )
+
+    if (
+        table.height
+        ==
+        0
+        or
+        "LOCUS_ID"
+        not in table.columns
+    ):
+
+        return pd.DataFrame()
+
+    if (
+        "FUNCTIONAL_CATEGORY"
+        not in table.columns
+    ):
+
+        table = table.with_columns(
+
+            pl.lit(
+                ""
+            )
+            .alias(
+                "FUNCTIONAL_CATEGORY"
+            )
         )
 
-        df = safe_tsv(path)
+    category = (
 
-        required = {
-            "QTL_TYPE",
-            "TISSUE",
+        pl.col(
+            "FUNCTIONAL_CATEGORY"
+        )
+        .fill_null(
+            ""
+        )
+        .cast(
+            pl.Utf8
+        )
+        .str.to_uppercase()
+    )
+
+    if "BIOTYPE" in table.columns:
+
+        biotype_column = (
+            "BIOTYPE"
+        )
+
+    elif "ALL_BIOTYPES" in table.columns:
+
+        biotype_column = (
+            "ALL_BIOTYPES"
+        )
+
+    else:
+
+        biotype_column = (
+            None
+        )
+
+    aggregations = [
+
+        pl.len()
+        .alias(
+            "VEP_N"
+        ),
+
+        (
+            category
+            ==
+            "CODING"
+        )
+        .sum()
+        .alias(
+            "CODING_N"
+        ),
+
+        (
+            category
+            !=
+            "CODING"
+        )
+        .sum()
+        .alias(
+            "NONCODING_N"
+        ),
+
+        (
+            category
+            ==
+            "INTRONIC"
+        )
+        .sum()
+        .alias(
+            "INTRONIC_N"
+        ),
+
+        (
+            category
+            ==
+            "INTERGENIC"
+        )
+        .sum()
+        .alias(
+            "INTERGENIC_N"
+        ),
+
+        (
+            category
+            ==
+            "NONCODING_RNA"
+        )
+        .sum()
+        .alias(
+            "NCRNA_N"
+        ),
+
+        (
+            category
+            ==
+            "SPLICING"
+        )
+        .sum()
+        .alias(
+            "VEP_SPLICE_N"
+        ),
+    ]
+
+    if biotype_column:
+
+        biotype = (
+
+            pl.col(
+                biotype_column
+            )
+            .fill_null(
+                ""
+            )
+            .cast(
+                pl.Utf8
+            )
+            .str.to_lowercase()
+        )
+
+        aggregations.append(
+
+            biotype
+            .str.contains(
+                "lncrna|lincrna|antisense|processed_transcript"
+            )
+            .sum()
+            .alias(
+                "LNCRNA_N"
+            )
+        )
+
+    return (
+
+        table
+        .group_by(
+            "LOCUS_ID"
+        )
+        .agg(
+            aggregations
+        )
+        .to_pandas()
+    )
+
+
+# =============================================================================
+# STEP 09 - SPLICEAI
+# READ DIRECTLY FROM STEP09
+# =============================================================================
+
+def spliceai_summary(
+    sp,
+    study,
+):
+
+    path = first_file(
+
+        sp[
+            "S09"
+        ],
+
+        [
+            f"{study}_SpliceAI_locus_summary.tsv",
+        ],
+    )
+
+    table = read_pl(
+        path
+    )
+
+    if table.height == 0:
+
+        return pd.DataFrame()
+
+    output = table.to_pandas()
+
+    rename = {
+
+        "N_INPUT_VARIANTS":
+            "S9_INPUT_N",
+
+        "N_SPLICEAI_SCORED":
+            "SPLICEAI_SCORED_N",
+
+        "N_SPLICEAI_GE_0_20":
+            "SPLICEAI_GE_020_N",
+
+        "N_SPLICEAI_GE_0_50":
+            "SPLICEAI_GE_050_N",
+
+        "N_SPLICEAI_GE_0_80":
+            "SPLICEAI_GE_080_N",
+
+        "N_GTEX_SQTL":
+            "S9_GTEX_SQTL_N",
+
+        "N_SPLICEAI_GE_0_20_AND_SQTL":
+            "SPLICEAI020_AND_SQTL_N",
+
+        "MAX_SPLICEAI_DS":
+            "MAX_SPLICEAI_DS",
+    }
+
+    return output.rename(
+
+        columns={
+
+            key:
+                value
+
+            for key, value
+            in rename.items()
+
+            if key
+            in output.columns
+        }
+    )
+
+
+# =============================================================================
+# STEP 10 - PANGOLIN
+# READ DIRECTLY FROM STEP10
+# =============================================================================
+
+def pangolin_summary(
+    sp,
+    study,
+):
+
+    path = first_file(
+
+        sp[
+            "S10"
+        ],
+
+        [
+            f"{study}_Pangolin_locus_summary.tsv",
+        ],
+    )
+
+    table = read_pl(
+        path
+    )
+
+    if table.height == 0:
+
+        return pd.DataFrame()
+
+    output = table.to_pandas()
+
+    rename = {
+
+        "N_VARIANTS":
+            "S10_INPUT_N",
+
+        "N_PANGOLIN_SCORED":
+            "PANGOLIN_SCORED_N",
+
+        "N_PANGOLIN_TOP_5PCT":
+            "PANGOLIN_TOP5_N",
+
+        "N_GTEX_SQTL":
+            "S10_GTEX_SQTL_N",
+
+        "N_VEP_SPLICE":
+            "S10_VEP_SPLICE_N",
+
+        "N_MULTI_SOURCE_GE_2":
+            "MULTISOURCE_GE2_N",
+
+        "MAX_PANGOLIN_ABS":
+            "MAX_PANGOLIN_ABS",
+
+        "MAX_SPLICEAI_DS":
+            "S10_MAX_SPLICEAI_DS",
+    }
+
+    return output.rename(
+
+        columns={
+
+            key:
+                value
+
+            for key, value
+            in rename.items()
+
+            if key
+            in output.columns
+        }
+    )
+
+
+# =============================================================================
+# STEP 11 GENE FIX
+# =============================================================================
+
+def effective_gene(
+    row,
+):
+
+    gene = str(
+
+        row.get(
             "QTL_GENE",
-            "LCLPP_MULTICAUSAL",
-        }
-
-        if df.empty or not required.issubset(df.columns):
-            continue
-
-        df = df.copy()
-
-        df["LCLPP_MULTICAUSAL"] = pd.to_numeric(
-            df["LCLPP_MULTICAUSAL"],
-            errors="coerce",
+            "",
         )
 
-        df["STUDY_ACCESSION"] = study
+    ).strip()
 
-        pieces.append(
-            df[
-                [
-                    "STUDY_ACCESSION",
-                    "QTL_TYPE",
-                    "TISSUE",
-                    "QTL_GENE",
-                    "LCLPP_MULTICAUSAL",
-                ]
-            ]
+    missing = {
+
+        "",
+
+        "none",
+
+        "nan",
+
+        "na",
+
+        ".",
+    }
+
+    if gene.lower() not in missing:
+
+        return gene
+
+    qtl_type = str(
+
+        row.get(
+            "QTL_TYPE",
+            "",
         )
 
-    if not pieces:
-        empty_gene = pd.DataFrame(
-            columns=[
-                "QTL_TYPE",
-                "QTL_GENE",
-                "N_STUDIES",
-                "MAX_BEST_LCLPP",
-                "MEDIAN_BEST_LCLPP",
-                "N_TISSUES",
-                "STUDIES",
-            ]
-        )
-        empty_tissue = pd.DataFrame(
-            columns=[
-                "QTL_TYPE",
-                "TISSUE",
-                "N_STUDIES",
-                "MAX_LCLPP",
-                "N_GENES",
-                "STUDIES",
-            ]
-        )
-        return empty_gene, empty_tissue
+    ).lower()
 
-    x = pd.concat(
-        pieces,
-        ignore_index=True,
+    phenotype = str(
+
+        row.get(
+            "QTL_PHENOTYPE",
+            "",
+        )
+
+    ).strip()
+
+    # Important:
+    # GTEx eQTL SuSiE sometimes stores the gene ID
+    # in the phenotype field rather than QTL_GENE.
+
+    if (
+        qtl_type
+        ==
+        "eqtl"
+        and
+        phenotype.lower()
+        not in missing
+    ):
+
+        return phenotype
+
+    match = re.search(
+
+        r"(ENSG\d+(?:\.\d+)?)",
+
+        phenotype,
     )
 
-    # first collapse each gene within each study
-    per_study_gene = (
-        x.groupby(
-            [
-                "STUDY_ACCESSION",
-                "QTL_TYPE",
-                "QTL_GENE",
-            ],
-            as_index=False,
-        )
-        .agg(
-            BEST_LCLPP=("LCLPP_MULTICAUSAL", "max"),
-            N_TISSUES=("TISSUE", "nunique"),
-        )
-    )
+    if match:
 
-    genes = (
-        per_study_gene.groupby(
-            [
-                "QTL_TYPE",
-                "QTL_GENE",
-            ],
-            as_index=False,
+        return match.group(
+            1
         )
-        .agg(
-            N_STUDIES=("STUDY_ACCESSION", "nunique"),
-            MAX_BEST_LCLPP=("BEST_LCLPP", "max"),
-            MEDIAN_BEST_LCLPP=("BEST_LCLPP", "median"),
-            N_TISSUES=("N_TISSUES", "sum"),
-            STUDIES=(
-                "STUDY_ACCESSION",
-                lambda s: ";".join(sorted(set(map(str, s)))),
-            ),
-        )
-    )
 
-    genes = (
-        genes[
-            genes["N_STUDIES"] >= 2
-        ]
-        .sort_values(
-            [
-                "N_STUDIES",
-                "MAX_BEST_LCLPP",
-                "MEDIAN_BEST_LCLPP",
-            ],
-            ascending=False,
-        )
-        .reset_index(drop=True)
-    )
-
-    tissues = (
-        x.groupby(
-            [
-                "QTL_TYPE",
-                "TISSUE",
-            ],
-            as_index=False,
-        )
-        .agg(
-            N_STUDIES=("STUDY_ACCESSION", "nunique"),
-            MAX_LCLPP=("LCLPP_MULTICAUSAL", "max"),
-            N_GENES=("QTL_GENE", "nunique"),
-            STUDIES=(
-                "STUDY_ACCESSION",
-                lambda s: ";".join(sorted(set(map(str, s)))),
-            ),
-        )
-    )
-
-    tissues = (
-        tissues[
-            tissues["N_STUDIES"] >= 2
-        ]
-        .sort_values(
-            [
-                "N_STUDIES",
-                "MAX_LCLPP",
-                "N_GENES",
-            ],
-            ascending=False,
-        )
-        .reset_index(drop=True)
-    )
-
-    return genes, tissues
+    return ""
 
 
 # =============================================================================
-# FILE INVENTORY
+# STEP11 PAIR TABLE
 # =============================================================================
 
-def build_inventory(
-    root: Path,
-    phenotype_slug: str,
-    ancestry_slug: str,
-) -> pd.DataFrame:
+def pair_table(
+    sp,
+    study,
+):
 
-    rows = []
+    path = first_file(
 
-    step_dirs = [
-        p
-        for p in root.iterdir()
-        if p.is_dir()
-        and re.match(r"^\d\d_", p.name)
-    ]
+        sp[
+            "S11"
+        ],
 
-    for step_dir in sorted(step_dirs):
-        # Prefer phenotype/ancestry subtree when it exists.
-        scoped = (
-            step_dir
-            / phenotype_slug
-            / ancestry_slug
-        )
+        [
+            f"{study}_GTEx_SuSiE_gene_tissue_colocalization.tsv",
+        ],
+    )
 
-        search_root = (
-            scoped
-            if scoped.exists()
-            else step_dir
-        )
+    table = read_pl(
+        path
+    )
 
-        for path in search_root.rglob("*"):
-            if not path.is_file():
-                continue
+    if table.height == 0:
 
-            m = re.search(
-                r"(GCST\d+)",
-                str(path),
+        return pd.DataFrame()
+
+    data = table.to_pandas()
+
+    data[
+        "STUDY"
+    ] = study
+
+    data[
+        "EFFECTIVE_GENE"
+    ] = data.apply(
+
+        effective_gene,
+
+        axis=1,
+    )
+
+    for column in [
+
+        "LCLPP_MULTICAUSAL",
+
+        "TOP_SHARED_GWAS_PIP",
+
+        "TOP_SHARED_QTL_PIP",
+
+        "TOP_SHARED_VCLPP",
+
+        "MAX_VCLPP",
+
+    ]:
+
+        if column in data.columns:
+
+            data[
+                column
+            ] = pd.to_numeric(
+
+                data[
+                    column
+                ],
+
+                errors="coerce",
             )
 
-            rows.append({
-                "STEP_DIR": step_dir.name,
-                "STUDY_ACCESSION": m.group(1) if m else "",
-                "FILE": str(path),
-                "SIZE_BYTES": path.stat().st_size,
-                "SIZE": human_size(path.stat().st_size),
-            })
+    return data
 
-    if not rows:
-        return pd.DataFrame(
-            columns=[
-                "STEP_DIR",
-                "STUDY_ACCESSION",
-                "FILE",
-                "SIZE_BYTES",
-                "SIZE",
-            ]
+
+# =============================================================================
+# BEST eQTL / sQTL PER LOCUS
+# =============================================================================
+
+def best_qtl_by_locus(
+    pairs,
+    qtl_type,
+):
+
+    if pairs.empty:
+
+        return pd.DataFrame()
+
+    data = pairs[
+
+        pairs[
+            "QTL_TYPE"
+        ]
+        .astype(
+            str
         )
+        .str.lower()
+        ==
+        qtl_type.lower()
 
-    return (
-        pd.DataFrame(rows)
+    ].copy()
+
+    if data.empty:
+
+        return pd.DataFrame()
+
+    data = (
+
+        data
+
         .sort_values(
+
             [
-                "STEP_DIR",
-                "STUDY_ACCESSION",
-                "FILE",
-            ]
+                "LOCUS_ID",
+                "LCLPP_MULTICAUSAL",
+            ],
+
+            ascending=[
+                True,
+                False,
+            ],
+
+            kind="stable",
         )
-        .reset_index(drop=True)
+
+        .drop_duplicates(
+
+            "LOCUS_ID",
+
+            keep="first",
+        )
+    )
+
+    prefix = (
+
+        "EQTL"
+
+        if qtl_type.lower()
+        ==
+        "eqtl"
+
+        else
+
+        "SQTL"
+    )
+
+    keep = [
+
+        "LOCUS_ID",
+
+        "EFFECTIVE_GENE",
+
+        "TISSUE",
+
+        "LCLPP_MULTICAUSAL",
+
+        "TOP_SHARED_VARIANT",
+
+        "TOP_SHARED_GWAS_PIP",
+
+        "TOP_SHARED_QTL_PIP",
+
+        "TOP_SHARED_VCLPP",
+
+        "COLOC_SCREEN_CLASS",
+    ]
+
+    keep = [
+
+        column
+
+        for column
+        in keep
+
+        if column
+        in data.columns
+    ]
+
+    data = data[
+        keep
+    ]
+
+    return data.rename(
+
+        columns={
+
+            column:
+                f"{prefix}_{column}"
+
+            for column
+            in data.columns
+
+            if column
+            !=
+            "LOCUS_ID"
+        }
     )
 
 
 # =============================================================================
-# MASTER TABLE
+# MAIN PER-LOCUS REPORT
 # =============================================================================
 
-def master_table(
-    studies,
-    step02,
-    step03,
-    step05,
-    step06,
-    step07,
-    step08,
-    step09,
-    step10,
-    step11,
+def locus_report(
+    sp,
+    study,
 ):
-    master = pd.DataFrame({
-        "STUDY_ACCESSION": studies
-    })
 
-    tables = [
-        step02,
-        step03,
-        step05,
-        step06,
-        step07,
-        step08,
-        step09,
-        step10,
-        step11,
+    base = loci_definition(
+
+        sp,
+
+        study,
+    )
+
+    if base.empty:
+
+        return pd.DataFrame()
+
+    extra_tables = [
+
+        cs_summary(
+            sp
+        ),
+
+        vep_summary(
+            sp
+        ),
+
+        spliceai_summary(
+            sp,
+            study,
+        ),
+
+        pangolin_summary(
+            sp,
+            study,
+        ),
     ]
 
-    for table in tables:
-        if table is not None and not table.empty:
-            master = master.merge(
-                table,
-                on="STUDY_ACCESSION",
+    for extra in extra_tables:
+
+        if (
+            not extra.empty
+            and
+            "LOCUS_ID"
+            in extra.columns
+        ):
+
+            base = base.merge(
+
+                extra,
+
+                on="LOCUS_ID",
+
                 how="left",
             )
 
-    return master
+    pairs = pair_table(
 
+        sp,
 
-def completion_matrix(
-    studies,
-    step02,
-    step03,
-    step05,
-    step06,
-    step07,
-    step08,
-    step09,
-    step10,
-    step11,
-):
-    base = pd.DataFrame({
-        "STUDY_ACCESSION": studies
-    })
+        study,
+    )
 
-    mappings = [
-        ("STEP02", step02, "STEP02_DOWNLOADED"),
-        ("STEP03", step03, "STEP03_STATUS"),
-        ("STEP05", step05, "STEP05_STATUS"),
-        ("STEP06", step06, "STEP06_STATUS"),
-        ("STEP07", step07, "STEP07_STATUS"),
-        ("STEP08", step08, "STEP08_STATUS"),
-        ("STEP09", step09, "STEP09_STATUS"),
-        ("STEP10", step10, "STEP10_STATUS"),
-        ("STEP11", step11, "STEP11_STATUS"),
+    for extra in [
+
+        best_qtl_by_locus(
+            pairs,
+            "eQTL",
+        ),
+
+        best_qtl_by_locus(
+            pairs,
+            "sQTL",
+        ),
+
+    ]:
+
+        if not extra.empty:
+
+            base = base.merge(
+
+                extra,
+
+                on="LOCUS_ID",
+
+                how="left",
+            )
+
+    eqtl = pd.to_numeric(
+
+        base.get(
+
+            "EQTL_LCLPP_MULTICAUSAL",
+
+            pd.Series(
+                np.nan,
+                index=base.index,
+            ),
+        ),
+
+        errors="coerce",
+    )
+
+    sqtl = pd.to_numeric(
+
+        base.get(
+
+            "SQTL_LCLPP_MULTICAUSAL",
+
+            pd.Series(
+                np.nan,
+                index=base.index,
+            ),
+        ),
+
+        errors="coerce",
+    )
+
+    matrix = np.vstack(
+
+        [
+            eqtl.to_numpy(),
+            sqtl.to_numpy(),
+        ]
+    )
+
+    with np.errstate(
+        all="ignore"
+    ):
+
+        best = np.nanmax(
+
+            matrix,
+
+            axis=0,
+        )
+
+    best = np.where(
+
+        np.isfinite(
+            best
+        ),
+
+        best,
+
+        -np.inf,
+    )
+
+    base[
+        "BEST_LOCUS_LCLPP"
+    ] = np.where(
+
+        np.isfinite(
+            best
+        ),
+
+        best,
+
+        np.nan,
+    )
+
+    base[
+        "EVIDENCE_RANK"
+    ] = rankdata(
+
+        -best,
+
+        method="min",
+
+    ).astype(
+        int
+    )
+
+    columns = [
+
+        "STUDY",
+
+        "EVIDENCE_RANK",
+
+        "LOCUS_ID",
+
+        "CHR",
+
+        "LOCUS_START",
+
+        "LOCUS_END",
+
+        "LEAD_POSITIONS",
+
+        "CS95_N",
+
+        "CS95_MAX_PIP",
+
+        "CODING_N",
+
+        "NONCODING_N",
+
+        "INTRONIC_N",
+
+        "INTERGENIC_N",
+
+        "NCRNA_N",
+
+        "LNCRNA_N",
+
+        # Best expression evidence
+        "EQTL_EFFECTIVE_GENE",
+
+        "EQTL_TISSUE",
+
+        "EQTL_LCLPP_MULTICAUSAL",
+
+        "EQTL_TOP_SHARED_VARIANT",
+
+        # Best splicing QTL
+        "SQTL_EFFECTIVE_GENE",
+
+        "SQTL_TISSUE",
+
+        "SQTL_LCLPP_MULTICAUSAL",
+
+        "SQTL_TOP_SHARED_VARIANT",
+
+        # SpliceAI direct evidence
+        "SPLICEAI_SCORED_N",
+
+        "SPLICEAI_GE_020_N",
+
+        "SPLICEAI_GE_050_N",
+
+        "MAX_SPLICEAI_DS",
+
+        "TOP_SPLICEAI_GENE",
+
+        "TOP_SPLICEAI_EVENT",
+
+        # Pangolin
+        "PANGOLIN_SCORED_N",
+
+        "PANGOLIN_TOP5_N",
+
+        "MAX_PANGOLIN_ABS",
+
+        # Combined splice evidence
+        "MULTISOURCE_GE2_N",
+
+        "BEST_LOCUS_LCLPP",
     ]
 
-    for name, table, col in mappings:
-        if table.empty or col not in table.columns:
-            base[name] = "MISSING"
-            continue
+    columns = [
 
-        x = table[
+        column
+
+        for column
+        in columns
+
+        if column
+        in base.columns
+    ]
+
+    return (
+
+        base[
+            columns
+        ]
+
+        .sort_values(
+            "EVIDENCE_RANK"
+        )
+
+        .reset_index(
+            drop=True
+        )
+    )
+
+
+# =============================================================================
+# CROSS-GWAS COMMON LOCUS DETECTION
+#
+# IMPORTANT:
+# L001 from study A is NOT compared to L001 from study B.
+#
+# We compare chromosome intervals:
+#
+#     CHR
+#     LOCUS_START
+#     LOCUS_END
+#
+# =============================================================================
+
+def cluster_common_loci(
+    all_loci,
+):
+
+    if all_loci.empty:
+
+        return (
+            pd.DataFrame(),
+            {},
+        )
+
+    data = all_loci.dropna(
+
+        subset=[
+
+            "CHR",
+
+            "LOCUS_START",
+
+            "LOCUS_END",
+        ]
+
+    ).copy()
+
+    data[
+        "CHR"
+    ] = data[
+        "CHR"
+    ].astype(
+        int
+    )
+
+    data[
+        "LOCUS_START"
+    ] = data[
+        "LOCUS_START"
+    ].astype(
+        int
+    )
+
+    data[
+        "LOCUS_END"
+    ] = data[
+        "LOCUS_END"
+    ].astype(
+        int
+    )
+
+    data = (
+
+        data
+
+        .sort_values(
+
             [
-                "STUDY_ACCESSION",
-                col,
+                "CHR",
+                "LOCUS_START",
+                "LOCUS_END",
             ]
-        ].copy()
+        )
 
-        x = x.rename(
-            columns={
-                col: name
+        .reset_index(
+            drop=True
+        )
+    )
+
+    clusters = []
+
+    mapping = {}
+
+    cluster_number = 0
+
+    for chromosome, group in data.groupby(
+
+        "CHR",
+
+        sort=True,
+
+    ):
+
+        current = None
+
+        for _, row in group.iterrows():
+
+            start = int(
+                row[
+                    "LOCUS_START"
+                ]
+            )
+
+            end = int(
+                row[
+                    "LOCUS_END"
+                ]
+            )
+
+            # Start new common cluster if it no longer overlaps.
+
+            if (
+                current is None
+                or
+                start
+                >
+                current[
+                    "END"
+                ]
+            ):
+
+                if current is not None:
+
+                    clusters.append(
+                        current
+                    )
+
+                cluster_number += 1
+
+                current = {
+
+                    "COMMON_LOCUS_ID":
+                        f"C{cluster_number:03d}",
+
+                    "CHR":
+                        int(
+                            chromosome
+                        ),
+
+                    "START":
+                        start,
+
+                    "END":
+                        end,
+
+                    "MEMBERS":
+                        [],
+                }
+
+            else:
+
+                current[
+                    "END"
+                ] = max(
+
+                    current[
+                        "END"
+                    ],
+
+                    end,
+                )
+
+            current[
+                "MEMBERS"
+            ].append(
+                (
+                    row[
+                        "STUDY"
+                    ],
+
+                    row[
+                        "LOCUS_ID"
+                    ],
+                )
+            )
+
+            mapping[
+                (
+                    row[
+                        "STUDY"
+                    ],
+
+                    row[
+                        "LOCUS_ID"
+                    ],
+                )
+            ] = current[
+                "COMMON_LOCUS_ID"
+            ]
+
+        if current is not None:
+
+            clusters.append(
+                current
+            )
+
+    rows = []
+
+    for cluster in clusters:
+
+        studies = sorted(
+
+            {
+
+                study
+
+                for study, _
+                in cluster[
+                    "MEMBERS"
+                ]
             }
         )
 
-        base = base.merge(
-            x,
-            on="STUDY_ACCESSION",
-            how="left",
+        rows.append(
+            {
+
+                "COMMON_LOCUS_ID":
+                    cluster[
+                        "COMMON_LOCUS_ID"
+                    ],
+
+                "CHR":
+                    cluster[
+                        "CHR"
+                    ],
+
+                "START":
+                    cluster[
+                        "START"
+                    ],
+
+                "END":
+                    cluster[
+                        "END"
+                    ],
+
+                "N_STUDIES":
+                    len(
+                        studies
+                    ),
+
+                "N_SOURCE_LOCI":
+                    len(
+                        cluster[
+                            "MEMBERS"
+                        ]
+                    ),
+
+                "STUDIES":
+                    ";".join(
+                        studies
+                    ),
+
+                "SOURCE_LOCI":
+                    ";".join(
+
+                        f"{study}:{locus}"
+
+                        for study, locus
+                        in cluster[
+                            "MEMBERS"
+                        ]
+                    ),
+            }
         )
 
-        base[name] = (
-            base[name]
-            .fillna("MISSING")
-            .astype(str)
+    return (
+
+        pd.DataFrame(
+            rows
+        ),
+
+        mapping,
+    )
+
+
+# =============================================================================
+# ADD BIOLOGICAL EVIDENCE TO COMMON LOCI
+# =============================================================================
+
+def annotate_common_clusters(
+    common,
+    mapping,
+    locus_reports,
+    n_eligible,
+):
+
+    if common.empty:
+
+        return common
+
+    evidence = []
+
+    for report in locus_reports:
+
+        if report.empty:
+
+            continue
+
+        data = report.copy()
+
+        data[
+            "COMMON_LOCUS_ID"
+        ] = [
+
+            mapping.get(
+
+                (
+                    row.STUDY,
+                    row.LOCUS_ID,
+                ),
+
+                "",
+            )
+
+            for row
+            in data.itertuples()
+        ]
+
+        evidence.append(
+            data
         )
 
-    return base
+    if not evidence:
+
+        common[
+            "IN_ALL_FINEMAPPED_STUDIES"
+        ] = (
+
+            common[
+                "N_STUDIES"
+            ]
+            ==
+            n_eligible
+        )
+
+        return common
+
+    evidence = pd.concat(
+
+        evidence,
+
+        ignore_index=True,
+    )
+
+    rows = []
+
+    for common_id, group in evidence.groupby(
+
+        "COMMON_LOCUS_ID"
+    ):
+
+        genes = []
+
+        for column in [
+
+            "EQTL_EFFECTIVE_GENE",
+
+            "SQTL_EFFECTIVE_GENE",
+
+        ]:
+
+            if column not in group.columns:
+
+                continue
+
+            for value in group[
+                column
+            ].dropna():
+
+                value = str(
+                    value
+                )
+
+                if value.lower() in {
+
+                    "",
+
+                    "none",
+
+                    "nan",
+                }:
+
+                    continue
+
+                if value not in genes:
+
+                    genes.append(
+                        value
+                    )
+
+        best_lclpp = pd.to_numeric(
+
+            group.get(
+
+                "BEST_LOCUS_LCLPP",
+
+                pd.Series(
+                    dtype=float
+                ),
+            ),
+
+            errors="coerce",
+
+        ).max()
+
+        max_spliceai = pd.to_numeric(
+
+            group.get(
+
+                "MAX_SPLICEAI_DS",
+
+                pd.Series(
+                    dtype=float
+                ),
+            ),
+
+            errors="coerce",
+
+        ).max()
+
+        max_pangolin = pd.to_numeric(
+
+            group.get(
+
+                "MAX_PANGOLIN_ABS",
+
+                pd.Series(
+                    dtype=float
+                ),
+            ),
+
+            errors="coerce",
+
+        ).max()
+
+        spliceai_supported = pd.to_numeric(
+
+            group.get(
+
+                "SPLICEAI_GE_020_N",
+
+                pd.Series(
+                    dtype=float
+                ),
+            ),
+
+            errors="coerce",
+
+        ).fillna(
+            0
+        ).sum()
+
+        multisource = pd.to_numeric(
+
+            group.get(
+
+                "MULTISOURCE_GE2_N",
+
+                pd.Series(
+                    dtype=float
+                ),
+            ),
+
+            errors="coerce",
+
+        ).fillna(
+            0
+        ).sum()
+
+        rows.append(
+            {
+
+                "COMMON_LOCUS_ID":
+                    common_id,
+
+                "BEST_LCLPP_ACROSS_STUDIES":
+                    best_lclpp,
+
+                "TOP_GENES":
+                    ";".join(
+                        genes[
+                            :12
+                        ]
+                    ),
+
+                "MAX_SPLICEAI":
+                    max_spliceai,
+
+                "MAX_PANGOLIN":
+                    max_pangolin,
+
+                "N_SPLICEAI020_TOTAL":
+                    spliceai_supported,
+
+                "N_MULTISOURCE_GE2_TOTAL":
+                    multisource,
+            }
+        )
+
+    result = common.merge(
+
+        pd.DataFrame(
+            rows
+        ),
+
+        on="COMMON_LOCUS_ID",
+
+        how="left",
+    )
+
+    result[
+        "IN_ALL_FINEMAPPED_STUDIES"
+    ] = (
+
+        result[
+            "N_STUDIES"
+        ]
+        ==
+        n_eligible
+    )
+
+    return (
+
+        result
+
+        .sort_values(
+
+            [
+                "N_STUDIES",
+                "BEST_LCLPP_ACROSS_STUDIES",
+            ],
+
+            ascending=[
+                False,
+                False,
+            ],
+        )
+
+        .reset_index(
+            drop=True
+        )
+    )
+
+
+# =============================================================================
+# COMMON COLOCALIZED GENES
+# =============================================================================
+
+def common_gene_table(
+    pair_tables,
+    min_studies=2,
+):
+
+    usable = [
+
+        table
+
+        for table
+        in pair_tables
+
+        if not table.empty
+    ]
+
+    if not usable:
+
+        return pd.DataFrame()
+
+    data = pd.concat(
+
+        usable,
+
+        ignore_index=True,
+    )
+
+    data = data[
+
+        data[
+            "EFFECTIVE_GENE"
+        ]
+        .astype(
+            str
+        )
+        .str.len()
+        >
+        0
+
+    ].copy()
+
+    data[
+        "SOURCE_LOCUS"
+    ] = (
+
+        data[
+            "STUDY"
+        ].astype(
+            str
+        )
+
+        +
+        "::"
+
+        +
+        data[
+            "LOCUS_ID"
+        ].astype(
+            str
+        )
+    )
+
+    rows = []
+
+    for (
+        qtl_type,
+        gene
+    ), group in data.groupby(
+
+        [
+            "QTL_TYPE",
+            "EFFECTIVE_GENE",
+        ],
+
+        dropna=False,
+    ):
+
+        n_studies = group[
+            "STUDY"
+        ].nunique()
+
+        if n_studies < min_studies:
+
+            continue
+
+        scores = pd.to_numeric(
+
+            group[
+                "LCLPP_MULTICAUSAL"
+            ],
+
+            errors="coerce",
+        )
+
+        if scores.notna().any():
+
+            top = group.loc[
+                scores.idxmax()
+            ]
+
+            best = scores.max()
+
+        else:
+
+            top = group.iloc[
+                0
+            ]
+
+            best = np.nan
+
+        rows.append(
+            {
+
+                "QTL_TYPE":
+                    qtl_type,
+
+                "GENE":
+                    gene,
+
+                "N_STUDIES":
+                    n_studies,
+
+                "N_SOURCE_LOCI":
+                    group[
+                        "SOURCE_LOCUS"
+                    ].nunique(),
+
+                "N_TISSUES":
+                    group[
+                        "TISSUE"
+                    ].nunique(),
+
+                "BEST_LCLPP":
+                    best,
+
+                "BEST_TISSUE":
+                    top.get(
+                        "TISSUE",
+                        "",
+                    ),
+
+                "STUDIES":
+                    ";".join(
+
+                        sorted(
+
+                            group[
+                                "STUDY"
+                            ].unique()
+                        )
+                    ),
+            }
+        )
+
+    if not rows:
+
+        return pd.DataFrame()
+
+    return (
+
+        pd.DataFrame(
+            rows
+        )
+
+        .sort_values(
+
+            [
+                "N_STUDIES",
+                "BEST_LCLPP",
+            ],
+
+            ascending=[
+                False,
+                False,
+            ],
+        )
+
+        .reset_index(
+            drop=True
+        )
+    )
+
+
+# =============================================================================
+# COMMON EXACT TOP VARIANTS
+# =============================================================================
+
+def common_top_variants(
+    pair_tables,
+    min_studies=2,
+):
+
+    usable = [
+
+        table
+
+        for table
+        in pair_tables
+
+        if not table.empty
+    ]
+
+    if not usable:
+
+        return pd.DataFrame()
+
+    data = pd.concat(
+
+        usable,
+
+        ignore_index=True,
+    )
+
+    if (
+        "TOP_SHARED_VARIANT"
+        not in data.columns
+    ):
+
+        return pd.DataFrame()
+
+    data = data[
+
+        data[
+            "TOP_SHARED_VARIANT"
+        ].notna()
+
+    ].copy()
+
+    rows = []
+
+    for variant, group in data.groupby(
+
+        "TOP_SHARED_VARIANT"
+    ):
+
+        n_studies = group[
+            "STUDY"
+        ].nunique()
+
+        if n_studies < min_studies:
+
+            continue
+
+        genes = sorted(
+
+            {
+
+                gene
+
+                for gene
+                in group[
+                    "EFFECTIVE_GENE"
+                ].astype(
+                    str
+                )
+
+                if gene
+            }
+        )
+
+        rows.append(
+            {
+
+                "VARIANT":
+                    variant,
+
+                "N_STUDIES":
+                    n_studies,
+
+                "N_SOURCE_LOCI":
+                    (
+
+                        group[
+                            "STUDY"
+                        ].astype(
+                            str
+                        )
+
+                        +
+                        "::"
+
+                        +
+                        group[
+                            "LOCUS_ID"
+                        ].astype(
+                            str
+                        )
+
+                    ).nunique(),
+
+                "QTL_TYPES":
+                    ";".join(
+
+                        sorted(
+
+                            group[
+                                "QTL_TYPE"
+                            ]
+                            .astype(
+                                str
+                            )
+                            .unique()
+                        )
+                    ),
+
+                "BEST_LCLPP":
+                    pd.to_numeric(
+
+                        group[
+                            "LCLPP_MULTICAUSAL"
+                        ],
+
+                        errors="coerce",
+
+                    ).max(),
+
+                "GENES":
+                    ";".join(
+                        genes
+                    ),
+
+                "STUDIES":
+                    ";".join(
+
+                        sorted(
+
+                            group[
+                                "STUDY"
+                            ].unique()
+                        )
+                    ),
+            }
+        )
+
+    if not rows:
+
+        return pd.DataFrame()
+
+    return (
+
+        pd.DataFrame(
+            rows
+        )
+
+        .sort_values(
+
+            [
+                "N_STUDIES",
+                "BEST_LCLPP",
+            ],
+
+            ascending=[
+                False,
+                False,
+            ],
+        )
+
+        .reset_index(
+            drop=True
+        )
+    )
 
 
 # =============================================================================
@@ -2035,589 +3005,528 @@ def completion_matrix(
 # =============================================================================
 
 def main():
-    args = parse_args()
+
+    parser = argparse.ArgumentParser()
+
+
+    parser.add_argument(
+
+        "--phenotype",
+
+        required=True,
+    )
+
+
+    parser.add_argument(
+
+        "--ancestry",
+
+        required=True,
+    )
+
+
+    parser.add_argument(
+
+        "--study",
+    )
+
+
+    parser.add_argument(
+
+        "--top-genes",
+
+        type=int,
+
+        default=30,
+    )
+
+
+    parser.add_argument(
+
+        "--top-variants",
+
+        type=int,
+
+        default=30,
+    )
+
+
+    parser.add_argument(
+
+        "--min-common-studies",
+
+        type=int,
+
+        default=2,
+    )
+
+
+    args = parser.parse_args()
+
 
     root = Path.cwd().resolve()
 
-    phenotype = args.phenotype.strip()
-    phenotype_slug = slugify(phenotype)
 
-    ancestry_code, ancestry_label = canonical_ancestry(
+    ancestry_code, ancestry_label = ancestry_info(
+
         args.ancestry
     )
 
-    ancestry_slug = slugify(
-        ancestry_label
+
+    roots = roots_for(
+
+        root,
+
+        args.phenotype,
+
+        ancestry_label,
     )
 
-    paths = build_paths(
-        root,
-        phenotype_slug,
-        ancestry_slug,
-    )
 
     studies = discover_studies(
-        paths
+        roots
     )
+
 
     if args.study:
-        wanted = args.study.strip()
+
         studies = [
-            s
-            for s in studies
-            if s == wanted
+
+            study
+
+            for study
+            in studies
+
+            if study
+            ==
+            args.study
         ]
 
-        if not studies:
-            raise SystemExit(
-                f"Study {wanted!r} was not found for "
-                f"{phenotype} / {ancestry_label}."
-            )
 
     if not studies:
+
         raise SystemExit(
-            "No GCST studies were discovered.\n"
-            "Run this script from the GWAS2m project root and check:\n"
-            f"  phenotype = {phenotype}\n"
-            f"  ancestry  = {ancestry_label}"
+            "No matching studies found."
         )
 
-    report_dir = (
-        root
-        / "reports"
-        / phenotype_slug
-        / ancestry_slug
+
+    # =========================================================================
+    # HEADER
+    # =========================================================================
+
+    section(
+
+        "GWAS2m FAST REPORT - "
+        "LOCUS + COMMON-LOCUS + SPLICE EVIDENCE"
     )
 
-    report_dir.mkdir(
-        parents=True,
-        exist_ok=True,
+
+    print(
+        f"Version      : {VERSION}"
     )
 
-    terminal_report = (
-        report_dir
-        / "terminal_report.txt"
+    print(
+        f"Root         : {root}"
     )
 
-    original_stdout = sys.stdout
+    print(
+        f"Phenotype    : {args.phenotype}"
+    )
 
-    with open(
-        terminal_report,
-        "w",
-        encoding="utf-8",
-    ) as report_handle:
+    print(
+        f"Ancestry     : "
+        f"{ancestry_label} "
+        f"({ancestry_code})"
+    )
 
-        sys.stdout = Tee(
-            original_stdout,
-            report_handle,
+    print(
+        f"Studies      : "
+        f"{len(studies)}"
+    )
+
+    print(
+        "Saving files : NO"
+    )
+
+    print(
+        "Engine       : "
+        "Polars + SciPy"
+    )
+
+
+    # =========================================================================
+    # TABLE 1
+    # =========================================================================
+
+    funnel = pd.DataFrame(
+
+        [
+
+            pipeline_row(
+
+                study,
+
+                study_paths(
+                    roots,
+                    study,
+                ),
+            )
+
+            for study
+            in studies
+        ]
+    )
+
+
+    show(
+
+        funnel,
+
+        "TABLE 1 - PIPELINE FUNNEL / AUDIT",
+    )
+
+
+    # =========================================================================
+    # INDIVIDUAL LOCI
+    # =========================================================================
+
+    locus_reports = []
+
+    pair_tables = []
+
+    locus_definitions = []
+
+
+    for study in studies:
+
+        sp = study_paths(
+
+            roots,
+
+            study,
         )
 
-        try:
-            section(
-                "GWAS2m PIPELINE REPORT"
+
+        report = locus_report(
+
+            sp,
+
+            study,
+        )
+
+
+        if not report.empty:
+
+            locus_reports.append(
+                report
             )
 
-            print(
-                f"Report version : {REPORT_VERSION}"
-            )
-            print(
-                f"Project root   : {root}"
-            )
-            print(
-                f"Phenotype      : {phenotype}"
-            )
-            print(
-                f"Ancestry       : {ancestry_label} ({ancestry_code})"
-            )
-            print(
-                f"Studies found  : {len(studies)}"
-            )
-            print(
-                f"Studies        : {'; '.join(studies)}"
-            )
-            print(
-                f"Report folder  : {report_dir}"
-            )
 
-            # ---------------------------------------------------------
-            # Build all step tables
-            # ---------------------------------------------------------
+            show(
 
-            step02 = summarize_step01_02(
-                studies,
-                paths,
-            )
+                report,
 
-            step03 = summarize_step03(
-                studies,
-                paths,
-            )
-
-            step04 = summarize_step04(
-                root,
-                ancestry_code,
-            )
-
-            step05 = summarize_step05(
-                studies,
-                paths,
-            )
-
-            step06 = summarize_step06(
-                studies,
-                paths,
-            )
-
-            step07 = summarize_step07(
-                studies,
-                paths,
-            )
-
-            step08 = summarize_step08(
-                studies,
-                paths,
-            )
-
-            step09 = summarize_step09(
-                studies,
-                paths,
-            )
-
-            step10 = summarize_step10(
-                studies,
-                paths,
-            )
-
-            step11 = summarize_step11(
-                studies,
-                paths,
-            )
-
-            exclusions = collect_exclusions(
-                paths
-            )
-
-            warnings = collect_warnings(
-                root,
-                paths,
-            )
-
-            common_variants = common_finemapped_variants(
-                studies,
-                paths,
-                args.common_pip,
-            )
-
-            common_vep = common_vep_genes(
-                studies,
-                paths,
-            )
-
-            (
-                common_coloc_genes,
-                common_coloc_tissues,
-            ) = common_coloc(
-                studies,
-                paths,
-            )
-
-            inventory = build_inventory(
-                root,
-                phenotype_slug,
-                ancestry_slug,
-            )
-
-            master = master_table(
-                studies,
-                step02,
-                step03,
-                step05,
-                step06,
-                step07,
-                step08,
-                step09,
-                step10,
-                step11,
-            )
-
-            completion = completion_matrix(
-                studies,
-                step02,
-                step03,
-                step05,
-                step06,
-                step07,
-                step08,
-                step09,
-                step10,
-                step11,
-            )
-
-            # ---------------------------------------------------------
-            # Save every full table
-            # ---------------------------------------------------------
-
-            tables = {
-                "pipeline_master_summary.tsv": master,
-                "step_completion_matrix.tsv": completion,
-                "step01_02_discovery_download_summary.tsv": step02,
-                "step03_qc_summary.tsv": step03,
-                "step04_ld_reference_summary.tsv": step04,
-                "step05_clumping_summary.tsv": step05,
-                "step06_finemapping_summary.tsv": step06,
-                "step07_annotation_summary.tsv": step07,
-                "step08_gtex_qtl_summary.tsv": step08,
-                "step09_spliceai_summary.tsv": step09,
-                "step10_pangolin_summary.tsv": step10,
-                "step11_coloc_summary.tsv": step11,
-                "step_exclusion_summary.tsv": exclusions,
-                "tool_warning_error_summary.tsv": warnings,
-                "common_finemapped_variants.tsv": common_variants,
-                "common_vep_genes.tsv": common_vep,
-                "common_coloc_genes.tsv": common_coloc_genes,
-                "common_coloc_tissues.tsv": common_coloc_tissues,
-                "output_file_inventory.tsv": inventory,
-            }
-
-            for filename, table in tables.items():
-                save_table(
-                    table,
-                    report_dir / filename,
-                )
-
-            # ---------------------------------------------------------
-            # Print main report
-            # ---------------------------------------------------------
-
-            print_table(
-                "MASTER STUDY SUMMARY",
-                master,
-                max_rows=args.max_rows,
-                columns=[
-                    "STUDY_ACCESSION",
-                    "STEP03_STATUS",
-                    "N_VARIANTS_AFTER_QC",
-                    "N_GWS_QC",
-                    "N_LEAD_VARIANTS",
-                    "STEP06_STATUS",
-                    "N_LOCI_SUCCESS",
-                    "N_FINEMAPPED_VARIANTS",
-                    "N_95PCT_CS_ROWS",
-                    "MAX_PIP",
-                    "N_SELECTED_VARIANTS",
-                    "N_EQTL_VARIANTS",
-                    "N_SQTL_VARIANTS",
-                    "N_SPLICEAI_GE_0_20",
-                    "N_PANGOLIN_SCORED",
-                    "N_MULTI_SOURCE_GE_2",
-                    "N_UNIQUE_SHARED_VARIANTS",
-                    "N_GENE_TISSUE_PAIRS",
-                    "N_LCLPP_GE_0_01",
-                    "MAX_LCLPP",
-                ],
-            )
-
-            print_table(
-                "STEP COMPLETION MATRIX",
-                completion,
-                max_rows=args.max_rows,
-            )
-
-            print_table(
-                "STEP 01 / 02 - GWAS DISCOVERY + DOWNLOADS",
-                step02,
-                max_rows=args.max_rows,
-            )
-
-            print_table(
-                "STEP 03 - GWAS QC / HARMONIZATION",
-                step03,
-                max_rows=args.max_rows,
-            )
-
-            print_table(
-                "STEP 04 - ANCESTRY-SPECIFIC 1000G LD REFERENCE",
-                step04,
-                max_rows=22,
-            )
-
-            print()
-            print(
-                "Step04 chromosomes complete: "
-                f"{int(step04['COMPLETE'].sum())}/22"
-            )
-
-            print_table(
-                "STEP 05 - LD CLUMPING / LOCUS DEFINITION",
-                step05,
-                max_rows=args.max_rows,
-            )
-
-            print_table(
-                "STEP 06 - SuSiE FINE-MAPPING",
-                step06,
-                max_rows=args.max_rows,
-            )
-
-            print_table(
-                "STEP 07 - VEP FUNCTIONAL ANNOTATION",
-                step07,
-                max_rows=args.max_rows,
-            )
-
-            print_table(
-                "STEP 08 - GTEx v11 ALL-TISSUE eQTL / sQTL",
-                step08,
-                max_rows=args.max_rows,
-            )
-
-            print_table(
-                "STEP 09 - SPLICEAI",
-                step09,
-                max_rows=args.max_rows,
-            )
-
-            print_table(
-                "STEP 10 - PANGOLIN",
-                step10,
-                max_rows=args.max_rows,
-            )
-
-            print_table(
-                "STEP 11 - GTEx v11 SuSiE COLOCALIZATION",
-                step11,
-                max_rows=args.max_rows,
-            )
-
-            print_table(
-                "STUDY EXCLUSIONS / WHY A GWAS DID NOT ADVANCE",
-                exclusions,
-                max_rows=args.max_rows,
-            )
-
-            print_table(
-                "TOOL WARNINGS / ERRORS FOUND IN LOGS",
-                warnings,
-                max_rows=args.max_rows,
-                columns=[
-                    "STUDY_ACCESSION",
-                    "N_WARNING_LINES",
-                    "N_ERROR_OR_FAILED_LINES",
-                    "N_SKIPPING_VARIANT_LINES",
-                    "EXAMPLES",
-                    "FILE",
-                ],
-            )
-
-            print_table(
                 (
-                    "COMMON FINE-MAPPED VARIANTS ACROSS >=2 GWAS "
-                    f"(PIP >= {args.common_pip})"
+                    "TABLE 2 - "
+                    f"LOCUS INTERPRETATION: "
+                    f"{study}"
                 ),
-                common_variants,
-                max_rows=args.max_rows,
             )
 
-            print_table(
-                "COMMON VEP-MAPPED GENES ACROSS >=2 GWAS",
-                common_vep,
-                max_rows=args.max_rows,
+
+        pairs = pair_table(
+
+            sp,
+
+            study,
+        )
+
+
+        if not pairs.empty:
+
+            pair_tables.append(
+                pairs
             )
 
-            print_table(
-                "COMMON COLOCALIZED GENES ACROSS >=2 GWAS",
-                common_coloc_genes,
-                max_rows=args.max_rows,
+
+        loci = loci_definition(
+
+            sp,
+
+            study,
+        )
+
+
+        if not loci.empty:
+
+            locus_definitions.append(
+                loci
             )
 
-            print_table(
-                "COMMON COLOCALIZATION TISSUES ACROSS >=2 GWAS",
-                common_coloc_tissues,
-                max_rows=args.max_rows,
-            )
 
-            print_table(
-                "OUTPUT FILE INVENTORY",
-                inventory,
-                max_rows=args.max_rows,
-                columns=[
-                    "STEP_DIR",
-                    "STUDY_ACCESSION",
-                    "SIZE",
-                    "FILE",
-                ],
-            )
+    # =========================================================================
+    # COMMON LOCI
+    # =========================================================================
 
-            # ---------------------------------------------------------
-            # Global totals
-            # ---------------------------------------------------------
+    if locus_definitions:
 
-            section(
-                "PHENOTYPE / ANCESTRY GLOBAL SUMMARY"
-            )
+        all_loci = pd.concat(
 
-            print(
-                f"Phenotype                    : {phenotype}"
-            )
-            print(
-                f"Ancestry                     : {ancestry_label} ({ancestry_code})"
-            )
-            print(
-                f"GWAS studies discovered      : {len(studies)}"
-            )
+            locus_definitions,
 
-            if "N_VARIANTS_AFTER_QC" in step03.columns:
-                print(
-                    "Total variants after QC       : "
-                    f"{pd.to_numeric(step03['N_VARIANTS_AFTER_QC'], errors='coerce').sum():,.0f}"
-                )
+            ignore_index=True,
+        )
 
-            if "N_GWS_QC" in step03.columns:
-                print(
-                    "Total GWS variants after QC    : "
-                    f"{pd.to_numeric(step03['N_GWS_QC'], errors='coerce').sum():,.0f}"
-                )
+    else:
 
-            if "N_LEAD_VARIANTS" in step05.columns:
-                print(
-                    "Total independent lead variants: "
-                    f"{pd.to_numeric(step05['N_LEAD_VARIANTS'], errors='coerce').sum():,.0f}"
-                )
+        all_loci = pd.DataFrame()
 
-            if "N_LOCI_SUCCESS" in step06.columns:
-                print(
-                    "Fine-mapped loci completed     : "
-                    f"{pd.to_numeric(step06['N_LOCI_SUCCESS'], errors='coerce').sum():,.0f}"
-                )
 
-            if "N_FINEMAPPED_VARIANTS" in step06.columns:
-                print(
-                    "Fine-mapped variant rows        : "
-                    f"{pd.to_numeric(step06['N_FINEMAPPED_VARIANTS'], errors='coerce').sum():,.0f}"
-                )
+    n_eligible = (
 
-            if "N_95PCT_CS_ROWS" in step06.columns:
-                print(
-                    "95% credible-set rows           : "
-                    f"{pd.to_numeric(step06['N_95PCT_CS_ROWS'], errors='coerce').sum():,.0f}"
-                )
+        all_loci[
+            "STUDY"
+        ].nunique()
 
-            if "N_EQTL_VARIANTS" in step08.columns:
-                print(
-                    "GTEx eQTL-supported variants    : "
-                    f"{pd.to_numeric(step08['N_EQTL_VARIANTS'], errors='coerce').sum():,.0f}"
-                )
+        if not all_loci.empty
 
-            if "N_SQTL_VARIANTS" in step08.columns:
-                print(
-                    "GTEx sQTL-supported variants    : "
-                    f"{pd.to_numeric(step08['N_SQTL_VARIANTS'], errors='coerce').sum():,.0f}"
-                )
+        else
+        0
+    )
 
-            if "N_SPLICEAI_GE_0_20" in step09.columns:
-                print(
-                    "SpliceAI >=0.20 variants        : "
-                    f"{pd.to_numeric(step09['N_SPLICEAI_GE_0_20'], errors='coerce').sum():,.0f}"
-                )
 
-            if "N_PANGOLIN_SCORED" in step10.columns:
-                print(
-                    "Pangolin-scored variants        : "
-                    f"{pd.to_numeric(step10['N_PANGOLIN_SCORED'], errors='coerce').sum():,.0f}"
-                )
+    common, mapping = cluster_common_loci(
+        all_loci
+    )
 
-            if "N_VARIANT_OVERLAP_ROWS" in step11.columns:
-                print(
-                    "GTEx SuSiE overlap rows          : "
-                    f"{pd.to_numeric(step11['N_VARIANT_OVERLAP_ROWS'], errors='coerce').sum():,.0f}"
-                )
 
-            if "N_LCLPP_GE_0_01" in step11.columns:
-                print(
-                    "Coloc pairs LCLPP >=0.01        : "
-                    f"{pd.to_numeric(step11['N_LCLPP_GE_0_01'], errors='coerce').sum():,.0f}"
-                )
+    common = annotate_common_clusters(
 
-            print(
-                f"Common fine-mapped variants     : {len(common_variants):,}"
-            )
-            print(
-                f"Common VEP genes                : {len(common_vep):,}"
-            )
-            print(
-                f"Common colocalized genes        : {len(common_coloc_genes):,}"
-            )
-            print(
-                f"Common colocalization tissues   : {len(common_coloc_tissues):,}"
-            )
-            print(
-                f"Warnings/error files detected   : {len(warnings):,}"
-            )
+        common,
 
-            # ---------------------------------------------------------
-            # Manifest
-            # ---------------------------------------------------------
+        mapping,
 
-            manifest = {
-                "REPORT_VERSION": REPORT_VERSION,
-                "PROJECT_ROOT": str(root),
-                "PHENOTYPE": phenotype,
-                "PHENOTYPE_SLUG": phenotype_slug,
-                "ANCESTRY_CODE": ancestry_code,
-                "ANCESTRY_LABEL": ancestry_label,
-                "ANCESTRY_SLUG": ancestry_slug,
-                "N_STUDIES": len(studies),
-                "STUDIES": studies,
-                "COMMON_PIP_THRESHOLD": args.common_pip,
-                "REPORT_DIR": str(report_dir),
-                "TERMINAL_REPORT": str(terminal_report),
-                "TABLES": {
-                    filename: {
-                        "path": str(report_dir / filename),
-                        "rows": int(len(table)),
-                    }
-                    for filename, table in tables.items()
-                },
-            }
+        locus_reports,
 
-            (
-                report_dir
-                / "report_manifest.json"
-            ).write_text(
-                json.dumps(
-                    manifest,
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
+        n_eligible,
+    )
 
-            section(
-                "REPORT COMPLETE"
-            )
 
-            print(
-                f"Terminal report:\n  {terminal_report}"
-            )
+    if not common.empty:
 
-            print()
-            print(
-                "Full TSV tables:"
-            )
+        common_repeated = common[
 
-            for filename in tables:
-                print(
-                    f"  {report_dir / filename}"
-                )
+            common[
+                "N_STUDIES"
+            ]
+            >=
+            args.min_common_studies
 
-            print()
-            print(
-                f"Manifest:\n  {report_dir / 'report_manifest.json'}"
-            )
+        ].copy()
 
-        finally:
-            sys.stdout = original_stdout
+    else:
+
+        common_repeated = common
+
+
+    show(
+
+        common_repeated,
+
+        (
+            "TABLE 3 - COMMON GENOMIC LOCI ACROSS GWAS "
+            "(OVERLAPPING STEP06 LOCUS INTERVALS)"
+        ),
+    )
+
+
+    # =========================================================================
+    # LOCI FOUND IN ALL FINE-MAPPED STUDIES
+    # =========================================================================
+
+    if not common.empty:
+
+        common_all = common[
+
+            common[
+                "IN_ALL_FINEMAPPED_STUDIES"
+            ]
+
+        ].copy()
+
+    else:
+
+        common_all = common
+
+
+    show(
+
+        common_all,
+
+        (
+            "TABLE 4 - LOCI PRESENT IN ALL "
+            f"{n_eligible} FINE-MAPPED GWAS"
+        ),
+    )
+
+
+    # =========================================================================
+    # COMMON GENES
+    # =========================================================================
+
+    genes = common_gene_table(
+
+        pair_tables,
+
+        args.min_common_studies,
+    )
+
+
+    if not genes.empty:
+
+        genes = genes.head(
+            args.top_genes
+        )
+
+
+    show(
+
+        genes,
+
+        (
+            "TABLE 5 - COMMON COLOCALIZED GENES "
+            f"ACROSS >= "
+            f"{args.min_common_studies} GWAS "
+            f"(TOP {args.top_genes})"
+        ),
+    )
+
+
+    # =========================================================================
+    # COMMON EXACT VARIANTS
+    # =========================================================================
+
+    variants = common_top_variants(
+
+        pair_tables,
+
+        args.min_common_studies,
+    )
+
+
+    if not variants.empty:
+
+        variants = variants.head(
+            args.top_variants
+        )
+
+
+    show(
+
+        variants,
+
+        (
+            "TABLE 6 - COMMON TOP SHARED VARIANTS "
+            f"ACROSS >= "
+            f"{args.min_common_studies} GWAS "
+            f"(TOP {args.top_variants})"
+        ),
+    )
+
+
+    # =========================================================================
+    # NOTES
+    # =========================================================================
+
+    section(
+        "INTERPRETATION NOTES"
+    )
+
+
+    print(
+        "Fine-mapped GWAS contributing genomic loci: "
+        f"{n_eligible}"
+    )
+
+
+    print(
+        "\nCOMMON LOCUS:"
+    )
+
+    print(
+        "  Overlapping Step06 genomic intervals "
+        "on the same chromosome."
+    )
+
+    print(
+        "  Local labels such as L001 are NEVER "
+        "compared directly between studies."
+    )
+
+
+    print(
+        "\neQTL gene handling:"
+    )
+
+    print(
+        "  If QTL_GENE is blank/None, "
+        "QTL_PHENOTYPE is used as the gene ID."
+    )
+
+    print(
+        "  This allows both old and corrected "
+        "Step11 outputs to be interpreted."
+    )
+
+
+    print(
+        "\nSplicing:"
+    )
+
+    print(
+        "  SpliceAI is read directly from "
+        "Step09 locus summaries."
+    )
+
+    print(
+        "  Pangolin is read independently from "
+        "Step10 locus summaries."
+    )
+
+    print(
+        "  SpliceAI value/count = 0 means "
+        "the result was actually zero."
+    )
+
+    print(
+        "  NaN/MISSING means the upstream "
+        "file/result was unavailable."
+    )
+
+
+    print(
+        "\nPangolin:"
+    )
+
+    print(
+        "  Top-5% is a ranking within that study, "
+        "not a universal biological threshold."
+    )
+
+
+    print(
+        "\nColocalization:"
+    )
+
+    print(
+        "  LCLPP is still a screening score."
+    )
+
+    print(
+        "  It is NOT a formal coloc.susie posterior."
+    )
 
 
 if __name__ == "__main__":
+
     main()
- 
