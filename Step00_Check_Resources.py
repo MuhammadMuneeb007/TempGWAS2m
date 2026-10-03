@@ -295,7 +295,6 @@ dependencies:
   - pandas
   - numpy
   - scipy
-  - polars
   - pyarrow
   - duckdb
   - pysam
@@ -357,6 +356,7 @@ software_manifest = [
     ["aria2c", "mamba", "aria2"],
     ["VEP", "mamba", f"ensembl-vep={VEP_RELEASE}"],
     ["GWASLab", "pip", "gwaslab==4.2.3"],
+    ["Polars", "pip", "polars[rtcompat]"],
     ["SuSiE-RSS", "mamba", "r-susier"],
     ["coloc", "mamba", "r-coloc"],
     ["data.table", "mamba", "r-data.table"],
@@ -844,8 +844,10 @@ echo "=============================================================="
 echo "[2/4] GWASLAB + CORE SOFTWARE CHECK"
 echo "=============================================================="
 
-echo "COMMAND: $ENV/bin/python -m pip install gwaslab==4.2.3"
-"$ENV/bin/python" -m pip install --upgrade "gwaslab==4.2.3"
+echo "COMMAND: install GWASLab + CPU-compatible Polars runtime"
+"$ENV/bin/python" -m pip install --upgrade \
+    "gwaslab==4.2.3" \
+    "polars[rtcompat]"
 
 "$ENV/bin/python" - <<'COREPY'
 mods = [
@@ -1852,8 +1854,7 @@ for module in [
                 str(python),
                 "-c",
                 (
-                    "import importlib.util,sys;"
-                    f"sys.exit(0 if importlib.util.find_spec('{{module}}') else 1)"
+                    f"import {{module}}"
                 ),
             ],
             stdout=subprocess.DEVNULL,

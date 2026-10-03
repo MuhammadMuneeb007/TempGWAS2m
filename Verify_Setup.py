@@ -108,8 +108,7 @@ for module in [
                 str(python),
                 "-c",
                 (
-                    "import importlib.util,sys;"
-                    f"sys.exit(0 if importlib.util.find_spec('{module}') else 1)"
+                    f"import {module}"
                 ),
             ],
             stdout=subprocess.DEVNULL,

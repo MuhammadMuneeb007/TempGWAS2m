@@ -699,10 +699,7 @@ def planner_mode(args) -> None:
         )
     )
 
-    array_spec = (
-        f"1-{len(manifest)}"
-        f"%{args.max_parallel}"
-    )
+    array_spec = f"1-{len(manifest)}"
 
     job_name = (
         f"Pangolin_"

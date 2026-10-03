@@ -5,7 +5,7 @@
 #SBATCH --time=24:00:00
 #SBATCH --output=/data/ascher02/uqmmune1/Splice2/GWAS2m/logs/step05_clumping/epilepsy/european/clump.%A_%a.out
 #SBATCH --error=/data/ascher02/uqmmune1/Splice2/GWAS2m/logs/step05_clumping/epilepsy/european/clump.%A_%a.err
-#SBATCH --array=1-12%4
+#SBATCH --array=1-21%4
 #SBATCH --mem=32G
 #SBATCH --cpus-per-task=4
 #SBATCH --ntasks=1

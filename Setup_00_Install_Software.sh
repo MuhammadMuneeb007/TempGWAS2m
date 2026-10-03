@@ -38,8 +38,8 @@ echo "=============================================================="
 echo "[2/4] GWASLAB + CORE SOFTWARE CHECK"
 echo "=============================================================="
 
-echo "COMMAND: $ENV/bin/python -m pip install gwaslab==4.2.3"
-"$ENV/bin/python" -m pip install --upgrade "gwaslab==4.2.3"
+echo "COMMAND: install GWASLab + CPU-compatible Polars runtime"
+"$ENV/bin/python" -m pip install --upgrade     "gwaslab==4.2.3"     "polars[rtcompat]"
 
 "$ENV/bin/python" - <<'COREPY'
 mods = [

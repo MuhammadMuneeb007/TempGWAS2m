@@ -639,7 +639,7 @@ def planner_mode(args) -> None:
 
     bash_file = root / f"Step08_GTEx_QTL_{phenotype_slug}_{ancestry_slug}.sh"
     script_path = Path(__file__).resolve()
-    array_spec = f"1-{len(manifest)}%{args.max_parallel}"
+    array_spec = f"1-{len(manifest)}"
     job_name = f"GTEx_{phenotype_slug}_{ancestry_code.lower()}"[:100]
 
     bash_text = f'''#!/bin/bash

@@ -94,6 +94,12 @@ NOTES
 - Walltime is capped at 24 hours.
 - Planner is strict by default: Step 05 must be complete for all expected
   studies. Use --allow-incomplete only for exploratory/testing runs.
+- Effect statistics are accepted as Z, BETA+SE, OR+SE, or OR+95% CI.
+  For OR-based studies, BETA is reconstructed as log(OR); when SE is absent
+  but OR_95U/OR_95L are present, SE is reconstructed from the 95% CI.
+- LD size protection is applied AFTER 1000G reference MAF/GENO filtering.
+  If a locus is still larger than --max-ld-variants, a deterministic balanced
+  subset nearest the independent lead signals is used, with sidecar audit files.
 """
 
 from __future__ import annotations
@@ -1030,15 +1036,31 @@ def inspect_qc_columns(path: Path) -> dict[str, str | None]:
         "BETA": find_column(cols, ["BETA"]),
         "SE": find_column(cols, ["SE"]),
         "Z": find_column(cols, ["Z"]),
+        "OR": find_column(cols, ["OR"]),
+        "OR_95U": find_column(cols, ["OR_95U"]),
+        "OR_95L": find_column(cols, ["OR_95L"]),
         "SNPID": find_column(cols, ["SNPID", "rsID", "RSID"]),
     }
     required = ["CHR", "POS", "P", "EA", "NEA"]
     missing = [x for x in required if mapping[x] is None]
     if missing:
         raise RuntimeError(f"QC GWAS missing required columns {missing}: {path}")
-    if not ((mapping["BETA"] and mapping["SE"]) or mapping["Z"]):
+
+    effect_ready = bool(
+        mapping["Z"]
+        or (mapping["BETA"] and mapping["SE"])
+        or (
+            mapping["OR"]
+            and (
+                mapping["SE"]
+                or (mapping["OR_95U"] and mapping["OR_95L"])
+            )
+        )
+    )
+    if not effect_ready:
         raise RuntimeError(
-            f"QC GWAS needs BETA+SE or Z for SuSiE-RSS: {path}"
+            "QC GWAS needs Z, BETA+SE, OR+SE, or OR+95% CI "
+            f"for SuSiE-RSS: {path}"
         )
     return mapping
 
@@ -1077,16 +1099,56 @@ def extract_regional_gwas_once(
         canon["EA"] = chunk[mapping["EA"]].map(clean_allele)
         canon["NEA"] = chunk[mapping["NEA"]].map(clean_allele)
         canon["SNPID"] = chunk[mapping["SNPID"]].astype(str) if mapping["SNPID"] else ""
+        # -------------------------------------------------------------
+        # Effect statistic harmonisation for SuSiE-RSS.
+        #
+        # Preferred inputs:
+        #   1. Z directly
+        #   2. BETA + SE
+        #   3. OR + SE       -> BETA = log(OR), Z = BETA / SE
+        #   4. OR + 95% CI   -> reconstruct SE on the log-OR scale
+        # -------------------------------------------------------------
         if mapping["BETA"]:
-            canon["BETA"] = pd.to_numeric(chunk[mapping["BETA"]], errors="coerce")
+            canon["BETA"] = pd.to_numeric(
+                chunk[mapping["BETA"]], errors="coerce"
+            )
+        elif mapping["OR"]:
+            odds_ratio = pd.to_numeric(
+                chunk[mapping["OR"]], errors="coerce"
+            )
+            odds_ratio = odds_ratio.where(odds_ratio > 0)
+            canon["BETA"] = np.log(odds_ratio)
         else:
             canon["BETA"] = np.nan
+
         if mapping["SE"]:
-            canon["SE"] = pd.to_numeric(chunk[mapping["SE"]], errors="coerce")
+            canon["SE"] = pd.to_numeric(
+                chunk[mapping["SE"]], errors="coerce"
+            )
+        elif mapping["OR_95U"] and mapping["OR_95L"]:
+            upper = pd.to_numeric(
+                chunk[mapping["OR_95U"]], errors="coerce"
+            )
+            lower = pd.to_numeric(
+                chunk[mapping["OR_95L"]], errors="coerce"
+            )
+            upper = upper.where(upper > 0)
+            lower = lower.where(lower > 0)
+            canon["SE"] = (
+                np.log(upper) - np.log(lower)
+            ) / (2.0 * 1.959963984540054)
         else:
             canon["SE"] = np.nan
+
+        canon.loc[
+            (~np.isfinite(canon["SE"])) | (canon["SE"] <= 0),
+            "SE",
+        ] = np.nan
+
         if mapping["Z"]:
-            canon["Z"] = pd.to_numeric(chunk[mapping["Z"]], errors="coerce")
+            canon["Z"] = pd.to_numeric(
+                chunk[mapping["Z"]], errors="coerce"
+            )
         else:
             canon["Z"] = canon["BETA"] / canon["SE"]
 
@@ -1270,6 +1332,92 @@ def match_gwas_to_reference(regional: pd.DataFrame, reference: pd.DataFrame) -> 
 # =============================================================================
 
 
+def _parse_lead_positions(value: Any) -> list[int]:
+    positions = []
+    for token in str(value or "").split(";"):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            pos = int(float(token))
+        except Exception:
+            continue
+        if pos > 0:
+            positions.append(pos)
+    return sorted(set(positions))
+
+
+def _balanced_ld_subset(
+    matched: pd.DataFrame,
+    max_variants: int,
+    lead_positions: list[int],
+) -> pd.DataFrame:
+    """Deterministically cap an oversized locus while preserving lead neighborhoods.
+
+    Variants are first assigned to their nearest independent lead signal.  An
+    approximately equal quota is selected around each lead by physical distance,
+    then any remaining slots are filled globally by distance and association P.
+    This is only invoked AFTER the 1000G MAF/GENO filters have been applied.
+    """
+    if len(matched) <= max_variants:
+        return matched.copy()
+
+    work = matched.copy().reset_index(drop=True)
+    work["P"] = pd.to_numeric(work["P"], errors="coerce")
+    work["POS"] = pd.to_numeric(work["POS"], errors="coerce")
+
+    leads = [int(x) for x in lead_positions if int(x) > 0]
+    leads = sorted(set(leads))
+
+    if not leads:
+        # Fallback for an unexpected missing LEAD_POSITIONS field: retain the
+        # strongest associations deterministically rather than failing outright.
+        return (
+            work.sort_values(["P", "POS", "REFERENCE_ID"], kind="stable")
+            .head(max_variants)
+            .reset_index(drop=True)
+        )
+
+    pos = work["POS"].to_numpy(dtype=float)
+    lead_array = np.asarray(leads, dtype=float)
+    distances = np.abs(pos[:, None] - lead_array[None, :])
+    nearest_index = np.argmin(distances, axis=1)
+    nearest_distance = distances[np.arange(len(work)), nearest_index]
+
+    work["_NEAREST_LEAD_INDEX"] = nearest_index
+    work["_NEAREST_LEAD_POS"] = [leads[i] for i in nearest_index]
+    work["_LEAD_DISTANCE"] = nearest_distance
+
+    quota = max(1, max_variants // len(leads))
+    selected_indices: list[int] = []
+
+    for lead_index in range(len(leads)):
+        group = work[work["_NEAREST_LEAD_INDEX"] == lead_index]
+        if group.empty:
+            continue
+        group = group.sort_values(
+            ["_LEAD_DISTANCE", "P", "POS", "REFERENCE_ID"],
+            kind="stable",
+        )
+        selected_indices.extend(group.head(quota).index.tolist())
+
+    # De-duplicate and respect the exact cap.
+    selected_indices = list(dict.fromkeys(selected_indices))[:max_variants]
+
+    remaining_slots = max_variants - len(selected_indices)
+    if remaining_slots > 0:
+        remainder = work.drop(index=selected_indices, errors="ignore")
+        remainder = remainder.sort_values(
+            ["_LEAD_DISTANCE", "P", "POS", "REFERENCE_ID"],
+            kind="stable",
+        )
+        selected_indices.extend(remainder.head(remaining_slots).index.tolist())
+
+    selected = work.loc[selected_indices].copy()
+    selected = selected.sort_values(["P", "POS", "REFERENCE_ID"], kind="stable")
+    return selected.reset_index(drop=True)
+
+
 def calculate_ld(
     plink2: Path,
     root: Path,
@@ -1281,13 +1429,128 @@ def calculate_ld(
     geno: float,
     threads: int,
     max_variants: int,
+    lead_positions: list[int] | None = None,
 ) -> tuple[Path, Path, int]:
-    if len(matched) > max_variants:
+    """Build a validated LD matrix with post-reference-QC size protection."""
+    lead_positions = lead_positions or []
+
+    # ------------------------------------------------------------------
+    # 1. Start from all GWAS/reference matched variants.
+    # ------------------------------------------------------------------
+    all_ids_file = locus_dir / "matched_reference_ids_all.txt"
+    matched["REFERENCE_ID"].to_csv(all_ids_file, index=False, header=False)
+
+    # ------------------------------------------------------------------
+    # 2. Apply 1000G reference QC BEFORE enforcing the LD size cap.
+    #    --write-snplist gives the exact variants surviving MAF/GENO and
+    #    biallelic filters without constructing the dense LD matrix yet.
+    # ------------------------------------------------------------------
+    qc_prefix = locus_dir / f"{ancestry_code}_reference_qc"
+    run_command(
+        [
+            plink2,
+            "--pfile", reference_prefix(root, ancestry_code, chromosome),
+            "--extract", all_ids_file,
+            "--maf", maf,
+            "--geno", geno,
+            "--min-alleles", 2,
+            "--max-alleles", 2,
+            "--write-snplist",
+            "--threads", threads,
+            "--out", qc_prefix,
+        ],
+        locus_dir / f"{ancestry_code}_reference_qc.command.log",
+    )
+
+    snplist = Path(str(qc_prefix) + ".snplist")
+    if not snplist.exists():
+        raise RuntimeError("PLINK2 reference-QC SNP list is missing")
+
+    surviving_ids = [
+        x.strip() for x in snplist.read_text().splitlines() if x.strip()
+    ]
+    surviving_set = set(surviving_ids)
+
+    qc_matched = matched[
+        matched["REFERENCE_ID"].astype(str).isin(surviving_set)
+    ].copy()
+
+    # Preserve PLINK/reference order where possible for deterministic auditing.
+    order = {variant_id: i for i, variant_id in enumerate(surviving_ids)}
+    qc_matched["_REFERENCE_QC_ORDER"] = (
+        qc_matched["REFERENCE_ID"].astype(str).map(order)
+    )
+    qc_matched = qc_matched.sort_values(
+        ["_REFERENCE_QC_ORDER", "P"], kind="stable"
+    ).drop(columns=["_REFERENCE_QC_ORDER"])
+    qc_matched = qc_matched.reset_index(drop=True)
+
+    qc_matched.to_csv(
+        locus_dir / "reference_qc_matched_variants.tsv.gz",
+        sep="\t",
+        index=False,
+        compression="gzip",
+    )
+
+    if len(qc_matched) < 2:
         raise RuntimeError(
-            f"Matched locus has {len(matched):,} variants, exceeding --max-ld-variants={max_variants:,}"
+            f"Only {len(qc_matched)} matched variants survive reference MAF/GENO QC"
         )
+
+    # ------------------------------------------------------------------
+    # 3. If still oversized, deterministically retain balanced local
+    #    neighborhoods around the independent lead signals.
+    # ------------------------------------------------------------------
+    selected = qc_matched
+    selection_applied = len(qc_matched) > max_variants
+
+    if selection_applied:
+        print(
+            f"[WARNING] {len(qc_matched):,} variants survive reference QC; "
+            f"LD safety cap is {max_variants:,}."
+        )
+        print(
+            "[WARNING] Applying deterministic balanced selection around "
+            "independent lead positions."
+        )
+        selected = _balanced_ld_subset(
+            qc_matched,
+            max_variants=max_variants,
+            lead_positions=lead_positions,
+        )
+
+    selected.to_csv(
+        locus_dir / "ld_selected_variants.tsv.gz",
+        sep="\t",
+        index=False,
+        compression="gzip",
+    )
+
+    selection_summary = {
+        "N_MATCHED_BEFORE_REFERENCE_QC": int(len(matched)),
+        "N_AFTER_REFERENCE_QC": int(len(qc_matched)),
+        "MAX_LD_VARIANTS": int(max_variants),
+        "SELECTION_APPLIED": bool(selection_applied),
+        "N_SELECTED_FOR_LD": int(len(selected)),
+        "LEAD_POSITIONS": [int(x) for x in lead_positions],
+        "SELECTION_METHOD": (
+            "balanced_nearest_lead"
+            if selection_applied and lead_positions
+            else "association_rank_fallback"
+            if selection_applied
+            else "all_reference_qc_variants"
+        ),
+    }
+    (locus_dir / "ld_variant_selection_summary.json").write_text(
+        json.dumps(selection_summary, indent=2), encoding="utf-8"
+    )
+
     ids_file = locus_dir / "matched_reference_ids.txt"
-    matched["REFERENCE_ID"].to_csv(ids_file, index=False, header=False)
+    selected["REFERENCE_ID"].to_csv(ids_file, index=False, header=False)
+
+    # ------------------------------------------------------------------
+    # 4. Build the dense signed LD matrix from the final selected IDs.
+    # ------------------------------------------------------------------
     ld_prefix = locus_dir / f"{ancestry_code}_LD"
     run_command(
         [
@@ -1304,18 +1567,28 @@ def calculate_ld(
         ],
         locus_dir / f"{ancestry_code}_LD.command.log",
     )
+
     ld_file = locus_dir / f"{ancestry_code}_LD.unphased.vcor1.bin"
     vars_file = locus_dir / f"{ancestry_code}_LD.unphased.vcor1.bin.vars"
     if not ld_file.exists() or not vars_file.exists():
         raise RuntimeError("PLINK2 LD output is missing")
+
     variants = [x.strip() for x in vars_file.read_text().splitlines() if x.strip()]
     p = len(variants)
     expected_bytes = p * p * 4
     actual_bytes = ld_file.stat().st_size
     if p < 2 or actual_bytes != expected_bytes:
         raise RuntimeError(
-            f"LD matrix validation failed: p={p}, expected_bytes={expected_bytes}, actual_bytes={actual_bytes}"
+            f"LD matrix validation failed: p={p}, "
+            f"expected_bytes={expected_bytes}, actual_bytes={actual_bytes}"
         )
+
+    if p > max_variants:
+        raise RuntimeError(
+            f"Internal error: final LD matrix has {p:,} variants, "
+            f"above safety cap {max_variants:,}"
+        )
+
     return ld_file, vars_file, p
 
 
@@ -1647,6 +1920,9 @@ def worker_mode() -> None:
                 matched_file = locus_dir / "matched_variants.tsv"
                 matched.to_csv(matched_file, sep="\t", index=False)
 
+                lead_positions = _parse_lead_positions(
+                    locus.get("LEAD_POSITIONS", "")
+                )
                 ld_file, vars_file, p = calculate_ld(
                     plink2=plink2,
                     root=root,
@@ -1658,6 +1934,7 @@ def worker_mode() -> None:
                     geno=reference_geno,
                     threads=threads,
                     max_variants=max_ld_variants,
+                    lead_positions=lead_positions,
                 )
                 if p < min_variants:
                     raise RuntimeError(f"Only {p} variants remain in LD matrix; minimum is {min_variants}")
@@ -1708,6 +1985,10 @@ def worker_mode() -> None:
                 s["N_REGIONAL_GWAS_VARIANTS"] = len(regional)
                 s["N_MATCHED_VARIANTS"] = len(matched)
                 summary_frames.append(s)
+
+                locus_failure_marker = locus_dir / "LOCUS_FAILED.txt"
+                if locus_failure_marker.exists():
+                    locus_failure_marker.unlink()
 
             except Exception as exc:
                 failure_text = f"{type(exc).__name__}: {exc}"

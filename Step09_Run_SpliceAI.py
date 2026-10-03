@@ -453,7 +453,7 @@ def planner_mode(args) -> None:
 
     script_path = Path(__file__).resolve()
     bash_file = root / f"Step09_SpliceAI_{phenotype_slug}_{ancestry_slug}.sh"
-    array_spec = f"1-{len(manifest)}%{args.max_parallel}"
+    array_spec = f"1-{len(manifest)}"
     job_name = f"SpAI_{phenotype_slug}_{ancestry_code.lower()}"[:100]
 
     bash_text = f'''#!/bin/bash

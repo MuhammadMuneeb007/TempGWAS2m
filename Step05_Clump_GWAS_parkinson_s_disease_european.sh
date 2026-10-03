@@ -5,7 +5,7 @@
 #SBATCH --time=24:00:00
 #SBATCH --output=/data/ascher02/uqmmune1/Splice2/GWAS2m/logs/step05_clumping/parkinson_s_disease/european/clump.%A_%a.out
 #SBATCH --error=/data/ascher02/uqmmune1/Splice2/GWAS2m/logs/step05_clumping/parkinson_s_disease/european/clump.%A_%a.err
-#SBATCH --array=1-9%4
+#SBATCH --array=1-18%4
 #SBATCH --mem=32G
 #SBATCH --cpus-per-task=4
 #SBATCH --ntasks=1

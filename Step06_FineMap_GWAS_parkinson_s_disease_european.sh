@@ -5,7 +5,7 @@
 #SBATCH --time=24:00:00
 #SBATCH --output=/data/ascher02/uqmmune1/Splice2/GWAS2m/logs/step06_finemapping/parkinson_s_disease/european/finemap.%A_%a.out
 #SBATCH --error=/data/ascher02/uqmmune1/Splice2/GWAS2m/logs/step06_finemapping/parkinson_s_disease/european/finemap.%A_%a.err
-#SBATCH --array=1-9%2
+#SBATCH --array=1-18%2
 #SBATCH --mem=64G
 #SBATCH --cpus-per-task=8
 #SBATCH --ntasks=1

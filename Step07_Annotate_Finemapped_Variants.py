@@ -16,10 +16,14 @@ Direct one-study mode:
 Generated SLURM mode:
     sbatch Step07_Annotate_GWAS_migraine_european.sh
 
-Selection rule (preserved from the prior CAD pipeline):
-    - every 95% credible-set variant
-    - every variant with PIP >= --min-pip (default 0.01)
-    - the highest-PIP variant from every locus
+Annotation scope:
+    - every usable unique variant present in the Step 06 fine-mapped variant table
+      is sent to Ensembl VEP (not only credible-set/high-PIP variants).
+    - the previous prioritisation rules are retained as metadata flags:
+        * 95% credible-set membership
+        * PIP >= --min-pip (default 0.01)
+        * highest-PIP variant in each locus
+    - convenience PIP flags are also added at 0.01, 0.10, 0.50, and 0.90.
 
 Studies remain separate. Only Step 06 studies with successful loci are included
 by default. Partial Step 06 studies can be included with --allow-partial.
@@ -51,7 +55,8 @@ DEFAULT_MAX_PARALLEL = 2
 DEFAULT_MIN_PIP = 0.01
 ASSEMBLY = "GRCh38"
 SPECIES = "homo_sapiens"
-STEP07_VERSION = "1.0.0"
+STEP07_VERSION = "2.0.0"
+ANNOTATION_SCOPE = "ALL_FINEMAPPED_VARIANTS"
 
 ANCESTRY_ALIASES = {
     "eur": ("EUR", "European"),
@@ -189,7 +194,12 @@ def arguments():
     parser.add_argument("--memory", default=DEFAULT_MEMORY)
     parser.add_argument("--cpus", type=int, default=DEFAULT_CPUS)
     parser.add_argument("--max-parallel", type=int, default=DEFAULT_MAX_PARALLEL)
-    parser.add_argument("--min-pip", type=float, default=DEFAULT_MIN_PIP)
+    parser.add_argument(
+        "--min-pip",
+        type=float,
+        default=DEFAULT_MIN_PIP,
+        help="Priority-flag threshold only; all usable Step 06 variants are annotated.",
+    )
     parser.add_argument("--allow-partial", action="store_true")
     parser.add_argument("--vep", default=None)
     parser.add_argument("--vep-cache", default=None)
@@ -484,7 +494,7 @@ def planner_mode(args) -> None:
 
     script_path = Path(__file__).resolve()
     bash_file = root / f"Step07_Annotate_GWAS_{phenotype_slug}_{ancestry_slug}.sh"
-    array_spec = f"1-{len(manifest)}%{args.max_parallel}"
+    array_spec = f"1-{len(manifest)}"
     job_name = f"VEP_{phenotype_slug}_{ancestry_code.lower()}"[:100]
 
     bash_text = f"""#!/bin/bash
@@ -520,7 +530,7 @@ printf '%s\n' '=============================================================='
     print(f"Ancestry          : {ancestry_label} ({ancestry_code})")
     print(f"Eligible studies  : {len(manifest)}")
     print(f"Excluded studies  : {len(excluded)}")
-    print(f"Min PIP           : {args.min_pip}")
+    print(f"Min PIP           : {args.min_pip} (priority flag only)")
     print(f"VEP               : {vep}")
     print(f"VEP cache         : {vep_cache}")
     print(f"GRCh38 FASTA      : {vep_fasta}")
@@ -560,6 +570,12 @@ def load_finemapped_variants(path: Path) -> pd.DataFrame:
 
 
 def select_variants(df: pd.DataFrame, min_pip: float) -> pd.DataFrame:
+    """
+    Return ALL usable unique Step 06 variants for VEP annotation.
+
+    Historical selection rules are retained only as prioritisation metadata;
+    they no longer filter variants out before VEP.
+    """
     if "IN_95_CREDIBLE_SET" in df.columns:
         credible = as_bool_series(df["IN_95_CREDIBLE_SET"])
     elif "CREDIBLE_SET" in df.columns:
@@ -574,20 +590,40 @@ def select_variants(df: pd.DataFrame, min_pip: float) -> pd.DataFrame:
     if len(top_indices):
         top_variant.loc[top_indices] = True
 
-    selected = df.loc[credible | high_pip | top_variant].copy()
-    selected["SELECTED_CREDIBLE_SET"] = credible.loc[selected.index].to_numpy()
-    selected["SELECTED_PIP_THRESHOLD"] = high_pip.loc[selected.index].to_numpy()
-    selected["SELECTED_TOP_LOCUS"] = top_variant.loc[selected.index].to_numpy()
+    # Annotate the complete usable Step 06 universe.
+    selected = df.copy()
+    selected["SELECTED_CREDIBLE_SET"] = credible.to_numpy()
+    selected["SELECTED_PIP_THRESHOLD"] = high_pip.to_numpy()
+    selected["SELECTED_TOP_LOCUS"] = top_variant.to_numpy()
+
+    # Fixed PIP flags are convenient downstream and make the annotation table
+    # self-contained for later filtering without rerunning VEP.
+    selected["PIP_GE_0_01"] = selected["PIP"] >= 0.01
+    selected["PIP_GE_0_10"] = selected["PIP"] >= 0.10
+    selected["PIP_GE_0_50"] = selected["PIP"] >= 0.50
+    selected["PIP_GE_0_90"] = selected["PIP"] >= 0.90
+    selected["PRIORITIZED"] = (
+        selected["SELECTED_CREDIBLE_SET"]
+        | selected["SELECTED_PIP_THRESHOLD"]
+        | selected["SELECTED_TOP_LOCUS"]
+    )
+
     selected = selected.sort_values(
         ["CHR", "REFERENCE_POS", "PIP"],
         ascending=[True, True, False],
         kind="stable",
     )
+
+    # VEP only needs to annotate a genomic allele once per study. In the very
+    # unlikely event that a variant appears in overlapping locus records, keep
+    # the highest-PIP occurrence after the stable sort above.
     selected = selected.drop_duplicates(
         ["CHR", "REFERENCE_POS", "REFERENCE_REF", "REFERENCE_ALT"], keep="first"
     ).reset_index(drop=True)
+
     if selected.empty:
-        raise RuntimeError("No variants selected for annotation")
+        raise RuntimeError("No usable fine-mapped variants available for annotation")
+
     selected["VEP_ID"] = [f"GWASVEP_{i:08d}" for i in range(1, len(selected) + 1)]
     return selected
 
@@ -599,7 +635,8 @@ def create_vep_vcf(selected: pd.DataFrame, vcf_file: Path, mapping_file: Path) -
             "LOCUS_ID", "REFERENCE_ID", "CHR", "REFERENCE_POS",
             "REFERENCE_REF", "REFERENCE_ALT", "PIP", "IN_95_CREDIBLE_SET",
             "CREDIBLE_SET", "SELECTED_CREDIBLE_SET", "SELECTED_PIP_THRESHOLD",
-            "SELECTED_TOP_LOCUS", "rsID", "SNPID", "P", "BETA", "SE", "Z", "Z_REF",
+            "SELECTED_TOP_LOCUS", "PIP_GE_0_01", "PIP_GE_0_10", "PIP_GE_0_50",
+            "PIP_GE_0_90", "PRIORITIZED", "rsID", "SNPID", "P", "BETA", "SE", "Z", "Z_REF",
         ] if c in selected.columns
     ]
     selected[cols].to_csv(mapping_file, sep="\t", index=False)
@@ -867,15 +904,41 @@ def worker_mode() -> None:
     all_output = output_dir / f"{accession}_VEP_all_consequences.tsv.gz"
     best_output = output_dir / f"{accession}_VEP_best_consequence.tsv"
     variant_output = output_dir / f"{accession}_VEP_variant_summary.tsv"
+    prioritized_output = output_dir / f"{accession}_VEP_prioritized_variants.tsv"
     category_output = output_dir / f"{accession}_VEP_category_summary.tsv"
     locus_output = output_dir / f"{accession}_VEP_locus_summary.tsv"
     summary_json = output_dir / "annotation_summary.json"
     failed_file = output_dir / "ANNOTATION_FAILED.txt"
 
-    if not force and variant_output.exists() and variant_output.stat().st_size > 0 and summary_json.exists() and not failed_file.exists():
+    existing_summary = safe_read_json(summary_json)
+    existing_scope = str(existing_summary.get("ANNOTATION_SCOPE", "")).strip().upper()
+    current_input_size = fine_file.stat().st_size if fine_file.exists() else -1
+    current_input_mtime_ns = fine_file.stat().st_mtime_ns if fine_file.exists() else -1
+    previous_input_size = int(existing_summary.get("FINEMAPPED_INPUT_SIZE", -2) or -2)
+    previous_input_mtime_ns = int(existing_summary.get("FINEMAPPED_INPUT_MTIME_NS", -2) or -2)
+    scope_current = existing_scope == ANNOTATION_SCOPE
+    input_current = (
+        current_input_size == previous_input_size
+        and current_input_mtime_ns == previous_input_mtime_ns
+    )
+
+    if (
+        not force
+        and variant_output.exists()
+        and variant_output.stat().st_size > 0
+        and summary_json.exists()
+        and not failed_file.exists()
+        and scope_current
+        and input_current
+    ):
         banner("ANNOTATION ALREADY COMPLETE")
         print(accession)
+        print(f"Scope      : {ANNOTATION_SCOPE}")
         return
+
+    # If an older subset-only Step 07 result exists, the raw VEP output must
+    # not be reused because it does not contain all Step 06 variants.
+    rebuild_vep = force or not scope_current or not input_current
 
     banner("STEP 07 - VEP FUNCTIONAL ANNOTATION WORKER")
     print(f"Task       : {task_id}")
@@ -883,7 +946,7 @@ def worker_mode() -> None:
     print(f"Phenotype  : {phenotype}")
     print(f"Ancestry   : {ancestry_label} ({ancestry_code})")
     print(f"Fine-map   : {fine_file}")
-    print(f"Min PIP    : {min_pip}")
+    print(f"Min PIP    : {min_pip} (priority flag only; all variants annotated)")
     print(f"VEP        : {vep}")
     print(f"VEP cache  : {cache}")
     print(f"FASTA      : {fasta}")
@@ -912,18 +975,21 @@ def worker_mode() -> None:
 
         selected = select_variants(fine, min_pip)
         selected.to_csv(selected_file, sep="\t", index=False)
+        prioritized = selected.loc[selected["PRIORITIZED"]].copy()
+        prioritized.to_csv(prioritized_output, sep="\t", index=False)
         create_vep_vcf(selected, input_vcf, mapping_file)
 
-        banner("SELECTED VARIANTS")
+        banner("VARIANTS FOR ANNOTATION")
         print(f"Fine-mapped rows       : {len(fine):,}")
-        print(f"Selected variants      : {len(selected):,}")
-        print(f"Credible-set selected  : {int(selected['SELECTED_CREDIBLE_SET'].sum()):,}")
-        print(f"PIP-threshold selected : {int(selected['SELECTED_PIP_THRESHOLD'].sum()):,}")
-        print(f"Top-locus selected     : {int(selected['SELECTED_TOP_LOCUS'].sum()):,}")
+        print(f"Unique variants to VEP : {len(selected):,}")
+        print(f"Priority subset        : {len(prioritized):,}")
+        print(f"Credible-set flagged   : {int(selected['SELECTED_CREDIBLE_SET'].sum()):,}")
+        print(f"PIP-threshold flagged  : {int(selected['SELECTED_PIP_THRESHOLD'].sum()):,}")
+        print(f"Top-locus flagged      : {int(selected['SELECTED_TOP_LOCUS'].sum()):,}")
         print(f"Loci represented       : {selected['LOCUS_ID'].nunique():,}")
 
         banner("RUNNING VEP")
-        run_vep(vep, cache, fasta, input_vcf, vep_output, vep_log, threads, force)
+        run_vep(vep, cache, fasta, input_vcf, vep_output, vep_log, threads, rebuild_vep)
         vep_df = read_vep_output(vep_output)
         merged = merge_annotations(selected, vep_df, all_output)
         best = select_best_consequence(merged)
@@ -947,6 +1013,7 @@ def worker_mode() -> None:
             "ANCESTRY_CODE": ancestry_code,
             "ANCESTRY_LABEL": ancestry_label,
             "BUILD": ASSEMBLY,
+            "ANNOTATION_SCOPE": ANNOTATION_SCOPE,
             "MIN_PIP": min_pip,
             "N_FINEMAPPED_ROWS_AVAILABLE": int(len(fine)),
             "N_FINEMAPPED_LOCI": int(fine["LOCUS_ID"].nunique()),
@@ -954,6 +1021,11 @@ def worker_mode() -> None:
             "N_SELECTED_CREDIBLE_SET": int(selected["SELECTED_CREDIBLE_SET"].sum()),
             "N_SELECTED_PIP_THRESHOLD": int(selected["SELECTED_PIP_THRESHOLD"].sum()),
             "N_SELECTED_TOP_LOCUS": int(selected["SELECTED_TOP_LOCUS"].sum()),
+            "N_PRIORITIZED": int(selected["PRIORITIZED"].sum()),
+            "N_PIP_GE_0_01": int(selected["PIP_GE_0_01"].sum()),
+            "N_PIP_GE_0_10": int(selected["PIP_GE_0_10"].sum()),
+            "N_PIP_GE_0_50": int(selected["PIP_GE_0_50"].sum()),
+            "N_PIP_GE_0_90": int(selected["PIP_GE_0_90"].sum()),
             "N_VEP_CONSEQUENCE_ROWS": int(len(vep_df)),
             "N_ANNOTATED_VARIANTS": n_annotated,
             "N_UNANNOTATED_VARIANTS": int(len(selected) - n_annotated),
@@ -962,6 +1034,8 @@ def worker_mode() -> None:
             "N_REGULATORY": n_regulatory,
             "N_NONCODING_RNA": n_ncrna,
             "STEP07_VERSION": STEP07_VERSION,
+            "FINEMAPPED_INPUT_SIZE": int(fine_file.stat().st_size),
+            "FINEMAPPED_INPUT_MTIME_NS": int(fine_file.stat().st_mtime_ns),
             "VEP_EXECUTABLE": str(vep),
             "VEP_CACHE": str(cache),
             "VEP_FASTA": str(fasta),
@@ -972,6 +1046,7 @@ def worker_mode() -> None:
             "VEP_ALL_CONSEQUENCES": str(all_output),
             "VEP_BEST_CONSEQUENCE": str(best_output),
             "VEP_VARIANT_SUMMARY": str(variant_output),
+            "PRIORITIZED_VARIANTS_FILE": str(prioritized_output),
             "VEP_CATEGORY_SUMMARY": str(category_output),
             "VEP_LOCUS_SUMMARY": str(locus_output),
             "STATUS": "COMPLETE",
@@ -983,7 +1058,8 @@ def worker_mode() -> None:
 
         banner("STEP 07 ANNOTATION COMPLETE")
         print(f"Study                : {accession}")
-        print(f"Selected variants    : {len(selected):,}")
+        print(f"Variants sent to VEP : {len(selected):,}")
+        print(f"Priority subset      : {len(prioritized):,}")
         print(f"Annotated variants   : {n_annotated:,}")
         print(f"Splicing             : {n_splicing:,}")
         print(f"Coding               : {n_coding:,}")
