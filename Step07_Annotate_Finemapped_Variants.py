@@ -44,14 +44,15 @@ import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import gwas2m_config  # noqa: E402  (SLURM settings: config/slurm.yaml)
+
 import numpy as np
 import pandas as pd
 
-DEFAULT_PARTITION = "general"
-DEFAULT_TIME = "24:00:00"
-DEFAULT_MEMORY = "32G"
+# SLURM partition/time/memory/CPUs/throttle come from config/slurm.yaml
+# (stage "vep"); command-line flags still override them.
 DEFAULT_CPUS = 4
-DEFAULT_MAX_PARALLEL = 2
 DEFAULT_MIN_PIP = 0.01
 ASSEMBLY = "GRCh38"
 SPECIES = "homo_sapiens"
@@ -117,12 +118,8 @@ def parse_walltime(value: str) -> int:
 
 
 def validate_walltime(value: str) -> str:
-    seconds = parse_walltime(value)
-    if seconds <= 0:
-        raise ValueError("Walltime must be > 0")
-    if seconds > 86400:
-        raise ValueError("Maximum allowed walltime is 24 hours")
-    return value
+    """Central check (gwas2m_config): only a configured max_walltime applies."""
+    return gwas2m_config.validate_walltime(value)
 
 
 def safe_read_json(path: Path) -> dict:
@@ -177,7 +174,7 @@ def run_command(command, log_file: Path | None = None) -> str:
     return output
 
 
-def arguments():
+def arguments(argv=None):
     parser = argparse.ArgumentParser(
         description="Annotate Step 06 fine-mapped variants with Ensembl VEP."
     )
@@ -189,11 +186,11 @@ def arguments():
         default=None,
         help="Run one ANNOTATION_TASK_ID directly from the existing manifest.",
     )
-    parser.add_argument("--partition", default=DEFAULT_PARTITION)
-    parser.add_argument("--time", default=DEFAULT_TIME)
-    parser.add_argument("--memory", default=DEFAULT_MEMORY)
-    parser.add_argument("--cpus", type=int, default=DEFAULT_CPUS)
-    parser.add_argument("--max-parallel", type=int, default=DEFAULT_MAX_PARALLEL)
+    parser.add_argument("--partition", default=None)
+    parser.add_argument("--time", default=None)
+    parser.add_argument("--memory", default=None)
+    parser.add_argument("--cpus", type=int, default=None)
+    parser.add_argument("--max-parallel", type=int, default=None)
     parser.add_argument(
         "--min-pip",
         type=float,
@@ -213,7 +210,9 @@ def arguments():
         ),
     )
     parser.add_argument("--force", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    gwas2m_config.apply_stage_defaults(args, "vep")
+    return args
 
 
 def validate_arguments(args) -> None:
@@ -224,29 +223,17 @@ def validate_arguments(args) -> None:
         raise ValueError("--index must be >= 1")
     if args.cpus < 1:
         raise ValueError("--cpus must be >= 1")
-    if args.max_parallel < 1:
-        raise ValueError("--max-parallel must be >= 1")
+    if args.max_parallel < 0:
+        raise ValueError("--max-parallel must be >= 0 (0 = no throttle)")
     if not 0 <= args.min_pip <= 1:
         raise ValueError("--min-pip must be in [0,1]")
 
 
 def read_resource_env(root: Path) -> dict[str, str]:
-    path = root / "resource_paths.env"
-    out: dict[str, str] = {}
-    if not path.exists():
-        return out
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        if key.startswith("export "):
-            key = key[7:].strip()
-        value = value.strip().strip("'").strip('"')
-        if key:
-            out[key] = value
-    return out
+    """resource_paths.env written by Step00 (shared parser in gwas2m_resources)."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import gwas2m_resources
+    return gwas2m_resources.load_resource_paths(root)
 
 
 def resolve_vep_executable(root: Path, explicit: str | None) -> Path:
@@ -379,6 +366,79 @@ def detect_cache_release(cache_root: Path) -> str:
     return str(max(releases)) if releases else "UNKNOWN"
 
 
+def build_annotation_row(
+    args,
+    task_id: int,
+    accession: str,
+    fine_root: Path,
+    out_root: Path,
+    phenotype: str,
+    ancestry_code: str,
+    ancestry_label: str,
+    vep: Path,
+    vep_cache: Path,
+    vep_fasta: Path,
+    cache_release: str,
+) -> tuple[dict | None, dict | None]:
+    """One annotation manifest row (shared by planner_mode and Step01_10_Run.py).
+
+    Returns (manifest_row, None) or (None, exclusion_record).
+    """
+    study = fine_root / accession
+    summary_file = study / "finemapping_summary.json"
+    fine_file = study / f"{accession}_finemapped_variants.tsv.gz"
+    cs_file = study / f"{accession}_95pct_credible_sets.tsv"
+    summary = safe_read_json(summary_file)
+
+    status = str(summary.get("STATUS", "")).strip().upper()
+    n_loci = int(summary.get("N_LOCI", 0) or 0)
+    n_success = int(summary.get("N_LOCI_SUCCESS", 0) or 0)
+    n_failed = int(summary.get("N_LOCI_FAILED", 0) or 0)
+
+    reason = ""
+    if not summary:
+        reason = "Step 06 summary missing/unreadable"
+    elif status == "NO_SIGNIFICANT_LOCI" or n_loci == 0:
+        reason = "No significant loci to annotate"
+    elif n_success == 0:
+        reason = "No successfully fine-mapped loci"
+    elif n_failed > 0 and not args.allow_partial:
+        reason = f"Partial Step 06 result: {n_success} successful / {n_failed} failed loci"
+    elif not fine_file.exists() or fine_file.stat().st_size == 0:
+        reason = "Fine-mapped variant file missing/empty"
+
+    if reason:
+        return None, {
+            "STUDY_ACCESSION": accession,
+            "STEP06_STATUS": status,
+            "N_LOCI": n_loci,
+            "N_LOCI_SUCCESS": n_success,
+            "N_LOCI_FAILED": n_failed,
+            "REASON": reason,
+        }
+
+    return {
+        "ANNOTATION_TASK_ID": task_id,
+        "STUDY_ACCESSION": accession,
+        "PHENOTYPE": phenotype,
+        "ANCESTRY_CODE": ancestry_code,
+        "ANCESTRY_LABEL": ancestry_label,
+        "FINEMAPPED_VARIANTS_FILE": str(fine_file.resolve()),
+        "CREDIBLE_SETS_FILE": str(cs_file.resolve()) if cs_file.exists() else "",
+        "STEP06_SUMMARY_FILE": str(summary_file.resolve()),
+        "N_LOCI": n_loci,
+        "N_LOCI_SUCCESS": n_success,
+        "N_LOCI_FAILED": n_failed,
+        "MIN_PIP": args.min_pip,
+        "OUTPUT_DIR": str((out_root / accession).resolve()),
+        "VEP": str(vep),
+        "VEP_CACHE": str(vep_cache),
+        "VEP_FASTA": str(vep_fasta),
+        "VEP_CACHE_RELEASE": cache_release,
+        "FORCE": bool(args.force),
+    }, None
+
+
 def planner_mode(args) -> None:
     validate_arguments(args)
     root = Path.cwd().resolve()
@@ -417,64 +477,26 @@ def planner_mode(args) -> None:
     excluded = []
 
     for accession in sorted(accessions):
-        study = fine_root / accession
-        summary_file = study / "finemapping_summary.json"
-        fine_file = study / f"{accession}_finemapped_variants.tsv.gz"
-        cs_file = study / f"{accession}_95pct_credible_sets.tsv"
-        summary = safe_read_json(summary_file)
+        row, exclusion = build_annotation_row(
+            args,
+            task_id=len(rows) + 1,
+            accession=accession,
+            fine_root=fine_root,
+            out_root=out_root,
+            phenotype=phenotype,
+            ancestry_code=ancestry_code,
+            ancestry_label=ancestry_label,
+            vep=vep,
+            vep_cache=vep_cache,
+            vep_fasta=vep_fasta,
+            cache_release=cache_release,
+        )
 
-        status = str(summary.get("STATUS", "")).strip().upper()
-        n_loci = int(summary.get("N_LOCI", 0) or 0)
-        n_success = int(summary.get("N_LOCI_SUCCESS", 0) or 0)
-        n_failed = int(summary.get("N_LOCI_FAILED", 0) or 0)
-
-        reason = ""
-        if not summary:
-            reason = "Step 06 summary missing/unreadable"
-        elif status == "NO_SIGNIFICANT_LOCI" or n_loci == 0:
-            reason = "No significant loci to annotate"
-        elif n_success == 0:
-            reason = "No successfully fine-mapped loci"
-        elif n_failed > 0 and not args.allow_partial:
-            reason = f"Partial Step 06 result: {n_success} successful / {n_failed} failed loci"
-        elif not fine_file.exists() or fine_file.stat().st_size == 0:
-            reason = "Fine-mapped variant file missing/empty"
-
-        if reason:
-            excluded.append(
-                {
-                    "STUDY_ACCESSION": accession,
-                    "STEP06_STATUS": status,
-                    "N_LOCI": n_loci,
-                    "N_LOCI_SUCCESS": n_success,
-                    "N_LOCI_FAILED": n_failed,
-                    "REASON": reason,
-                }
-            )
+        if exclusion is not None:
+            excluded.append(exclusion)
             continue
 
-        rows.append(
-            {
-                "ANNOTATION_TASK_ID": len(rows) + 1,
-                "STUDY_ACCESSION": accession,
-                "PHENOTYPE": phenotype,
-                "ANCESTRY_CODE": ancestry_code,
-                "ANCESTRY_LABEL": ancestry_label,
-                "FINEMAPPED_VARIANTS_FILE": str(fine_file.resolve()),
-                "CREDIBLE_SETS_FILE": str(cs_file.resolve()) if cs_file.exists() else "",
-                "STEP06_SUMMARY_FILE": str(summary_file.resolve()),
-                "N_LOCI": n_loci,
-                "N_LOCI_SUCCESS": n_success,
-                "N_LOCI_FAILED": n_failed,
-                "MIN_PIP": args.min_pip,
-                "OUTPUT_DIR": str((out_root / accession).resolve()),
-                "VEP": str(vep),
-                "VEP_CACHE": str(vep_cache),
-                "VEP_FASTA": str(vep_fasta),
-                "VEP_CACHE_RELEASE": cache_release,
-                "FORCE": bool(args.force),
-            }
-        )
+        rows.append(row)
 
     excluded_file = out_root / "annotation_excluded_studies.tsv"
     if excluded:
@@ -494,20 +516,20 @@ def planner_mode(args) -> None:
 
     script_path = Path(__file__).resolve()
     bash_file = root / f"Step07_Annotate_GWAS_{phenotype_slug}_{ancestry_slug}.sh"
-    array_spec = f"1-{len(manifest)}"
+    array_spec = gwas2m_config.array_spec(len(manifest), args.max_parallel)
     job_name = f"VEP_{phenotype_slug}_{ancestry_code.lower()}"[:100]
 
+    sbatch_header = gwas2m_config.sbatch_header_from_args(
+        args,
+        job_name=job_name,
+        output=f"{log_root}/annotation.%A_%a.out",
+        error=f"{log_root}/annotation.%A_%a.err",
+        array=array_spec,
+    )
+
+
     bash_text = f"""#!/bin/bash
-#SBATCH --job-name={job_name}
-#SBATCH --nodes=1
-#SBATCH --partition={args.partition}
-#SBATCH --time={args.time}
-#SBATCH --output={log_root}/annotation.%A_%a.out
-#SBATCH --error={log_root}/annotation.%A_%a.err
-#SBATCH --array={array_spec}
-#SBATCH --mem={args.memory}
-#SBATCH --cpus-per-task={args.cpus}
-#SBATCH --ntasks=1
+{sbatch_header}
 
 set -euo pipefail
 cd {shlex.quote(str(root))}

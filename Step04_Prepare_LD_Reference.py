@@ -19,7 +19,7 @@ The script automatically:
 1. Finds the most recent GWAS project manifest.
 2. Detects phenotype and ancestry.
 3. Determines the correct 1000 Genomes ancestry populations.
-4. Downloads the small 1000 Genomes sample panel if needed.
+4. Uses the 1000 Genomes sample panel prepared by Step00 (never downloads).
 5. Creates the ancestry-specific sample list.
 6. Creates a chromosome manifest for chr1-22.
 7. Generates a SLURM array bash script.
@@ -46,8 +46,9 @@ and processes the corresponding chromosome.
 
 Each chromosome:
 
-1. Downloads the 1000 Genomes GRCh38 VCF.
-2. Downloads the VCF index.
+1. Uses the 1000 Genomes GRCh38 VCF prepared by Step00
+   (resources/1000G/raw; Step04 never downloads shared data).
+2. Uses the matching VCF index.
 3. Subsets samples to the requested ancestry.
 4. Converts the subset to PLINK2:
        .pgen
@@ -74,20 +75,18 @@ import time
 
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import gwas2m_config  # noqa: E402  (SLURM settings: config/slurm.yaml)
+
 import pandas as pd
-import requests
 
 
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
 
-PARTITION = "ascher"
-
-TIME_LIMIT = "240:00:00"
-
-MEMORY = "80G"
-
+# SLURM partition/time/memory/CPUs come from config/slurm.yaml (stage "ld");
+# CPUS_PER_TASK is only the thread fallback outside SLURM.
 CPUS_PER_TASK = 4
 
 
@@ -528,13 +527,20 @@ def chromosome_filename(
 
 
 # =============================================================================
-# SMALL FILE DOWNLOAD
+# SHARED 1000 GENOMES FILES (prepared by Step00; never downloaded here)
 # =============================================================================
 
-def download_small_file(
+def require_shared_file(
     url,
     destination,
 ):
+    """Use the Step00-prepared copy of a shared 1000 Genomes file.
+
+    Step04 no longer downloads anything. The file must already exist at
+    `destination` or in the central Step00 location (resources/1000G/raw or
+    resources/1000G/metadata); in the latter case `destination` is linked to it.
+    `url` is kept only to state the upstream source in the error message.
+    """
 
     destination = Path(
         destination
@@ -547,162 +553,45 @@ def download_small_file(
 
         return
 
-    destination.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    root = Path.cwd().resolve()
 
-    temporary = Path(
-        str(destination)
-        + ".part"
-    )
-
-    print(
-        f"Downloading:\n  {url}"
-    )
-
-    response = requests.get(
-        url,
-        timeout=120,
-    )
-
-    response.raise_for_status()
-
-    with open(
-        temporary,
-        "wb",
-    ) as handle:
-
-        handle.write(
-            response.content
-        )
-
-    temporary.replace(
-        destination
-    )
-
-
-# =============================================================================
-# LARGE FILE DOWNLOAD
-# =============================================================================
-
-def download_large_file(
-    url,
-    destination,
-):
-
-    destination = Path(
-        destination
-    )
-
-    if (
-        destination.exists()
-        and destination.stat().st_size > 0
+    for central in (
+        root / "resources" / "1000G" / "raw" / destination.name,
+        root / "resources" / "1000G" / "metadata" / destination.name,
     ):
 
-        print(
-            f"Already downloaded:\n  {destination}"
-        )
+        if (
+            central.exists()
+            and central.stat().st_size > 0
+        ):
 
-        return
-
-    destination.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    temporary = Path(
-        str(destination)
-        + ".part"
-    )
-
-    wget = shutil.which(
-        "wget"
-    )
-
-    curl = shutil.which(
-        "curl"
-    )
-
-    banner(
-        "DOWNLOADING"
-    )
-
-    print(
-        f"URL:\n  {url}"
-    )
-
-    print()
-
-    print(
-        f"Output:\n  {destination}"
-    )
-
-    if wget:
-
-        run_command(
-            [
-                wget,
-                "--continue",
-                "--tries=10",
-                "--timeout=60",
-                "-O",
-                str(temporary),
-                url,
-            ]
-        )
-
-    elif curl:
-
-        command = [
-            curl,
-            "--location",
-            "--fail",
-            "--retry",
-            "10",
-            "--retry-delay",
-            "5",
-        ]
-
-        if temporary.exists():
-
-            command.extend(
-                [
-                    "--continue-at",
-                    "-",
-                ]
+            destination.parent.mkdir(
+                parents=True,
+                exist_ok=True,
             )
 
-        command.extend(
-            [
-                "--output",
-                str(temporary),
-                url,
-            ]
-        )
+            if destination.is_symlink():
+                destination.unlink()
 
-        run_command(
-            command
-        )
+            destination.symlink_to(
+                central
+            )
 
-    else:
+            print(
+                f"Using Step00 shared file:\n  {central}"
+            )
 
-        raise RuntimeError(
-            "\nNeither wget nor curl is available."
-        )
+            return
 
-    if (
-        not temporary.exists()
-        or temporary.stat().st_size == 0
-    ):
-
-        raise RuntimeError(
-            "\nDownload failed:\n"
-            f"{url}"
-        )
-
-    temporary.replace(
-        destination
+    raise FileNotFoundError(
+        "\nRequired shared resource is unavailable:\n"
+        f"  {destination.name}\n"
+        f"  upstream source: {url}\n\n"
+        "Step04 does not download shared reference data.\n"
+        "Run:\n"
+        "  python Step00_Check_Resources.py --inspect\n"
+        "then:\n"
+        "  python Step00_Check_Resources.py --resources-only"
     )
 
 
@@ -1081,17 +970,17 @@ def planner_mode():
         "REFERENCE METADATA"
     )
 
-    download_small_file(
+    require_shared_file(
         PANEL_URL,
         panel_file,
     )
 
-    download_small_file(
+    require_shared_file(
         README_URL,
         readme_file,
     )
 
-    download_small_file(
+    require_shared_file(
         RELEASE_MANIFEST_URL,
         release_manifest_file,
     )
@@ -1287,18 +1176,17 @@ def planner_mode():
     job_name = (
         f"1000G_{code}"
     )
+    sbatch_header = gwas2m_config.sbatch_header_for_stage(
+        "ld",
+        job_name=job_name,
+        output=f"{log_directory}/chr.%A_%a.out",
+        error=f"{log_directory}/chr.%A_%a.err",
+        array=gwas2m_config.array_spec(22, gwas2m_config.get_stage_resources("ld")["max_parallel"]),
+    )
+
 
     bash_text = f"""#!/bin/bash
-#SBATCH --job-name={job_name}
-#SBATCH --nodes=1
-#SBATCH --partition={PARTITION}
-#SBATCH --time={TIME_LIMIT}
-#SBATCH --output={log_directory}/chr.%A_%a.out
-#SBATCH --error={log_directory}/chr.%A_%a.err
-#SBATCH --array=1-22
-#SBATCH --mem={MEMORY}
-#SBATCH --cpus-per-task={CPUS_PER_TASK}
-#SBATCH --ntasks=1
+{sbatch_header}
 
 set -euo pipefail
 
@@ -1720,12 +1608,12 @@ def worker_mode():
     # DOWNLOAD RAW CHROMOSOME
     # =========================================================================
 
-    download_large_file(
+    require_shared_file(
         url=vcf_url,
         destination=raw_vcf,
     )
 
-    download_large_file(
+    require_shared_file(
         url=tbi_url,
         destination=raw_tbi,
     )

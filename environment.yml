@@ -1,0 +1,66 @@
+name: pipeline
+
+channels:
+  - conda-forge
+  - bioconda
+
+dependencies:
+
+  # Python
+  - python=3.11
+
+  # Core Python scientific stack
+  # (single source of truth: gwas2m_resources.PYTHON_PACKAGES)
+  - pandas
+  - numpy
+  - scipy
+  - pyarrow
+  - duckdb
+  - pysam
+  - cyvcf2
+  - scikit-learn
+  - statsmodels
+  - matplotlib
+  - requests
+  - urllib3
+  - httpx
+  - tenacity
+  - tqdm
+  - orjson
+  - pyyaml
+  - networkx
+  - gprofiler-official
+
+  # Genomics
+  - plink2
+  - bcftools
+  - htslib
+  - samtools
+  - bedtools
+
+  # Download / compression
+  - aria2
+  - wget
+  - curl
+  - pigz
+  - zstd
+  - parallel
+  - rsync
+
+  # VEP
+  - ensembl-vep=116
+
+  # R
+  - r-base
+  - r-susier
+  - r-coloc
+  - r-data.table
+
+  # General
+  - git
+  - pip
+
+  # pip-only packages (also installed explicitly by Setup_00_Install_Software.sh)
+  - pip:
+      - gwaslab==4.2.3
+      - polars[rtcompat]

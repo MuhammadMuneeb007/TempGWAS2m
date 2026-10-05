@@ -63,6 +63,10 @@ builds a shared cache from the UNION of all Step-07 variants in the manifest.
 An fcntl file lock prevents two SLURM tasks from building it simultaneously.
 Other workers reuse the completed cache.
 
+When run per study by Step01_10_Run.py, STEP08_CACHE_ROOT points the cache at
+08_qtl/<phenotype>/<ancestry>/<GCST>/shared/ instead, because each study
+worker then has its own one-row manifest (and therefore its own target set).
+
 OUTPUT
 ======
 
@@ -111,17 +115,18 @@ import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import gwas2m_config  # noqa: E402  (SLURM settings: config/slurm.yaml)
+
 import numpy as np
 import pandas as pd
 
 
 STEP08_VERSION = "1.0.0"
 
-DEFAULT_PARTITION = "general"
-DEFAULT_TIME = "24:00:00"
-DEFAULT_MEMORY = "64G"
+# SLURM partition/time/memory/CPUs/throttle come from config/slurm.yaml
+# (stage "qtl"); command-line flags still override them.
 DEFAULT_CPUS = 4
-DEFAULT_MAX_PARALLEL = 2
 DEFAULT_CHUNK_SIZE = 500_000
 
 ANCESTRY_ALIASES = {
@@ -188,12 +193,8 @@ def parse_walltime(value: str) -> int:
 
 
 def validate_walltime(value: str) -> str:
-    seconds = parse_walltime(value)
-    if seconds <= 0:
-        raise ValueError("Walltime must be greater than zero")
-    if seconds > 86400:
-        raise ValueError("Maximum allowed walltime is 24 hours")
-    return value
+    """Central check (gwas2m_config): only a configured max_walltime applies."""
+    return gwas2m_config.validate_walltime(value)
 
 
 def safe_read_json(path: Path) -> dict:
@@ -249,28 +250,17 @@ def sha256_strings(values) -> str:
 
 
 def read_resource_env(root: Path) -> dict[str, str]:
-    path = root / "resource_paths.env"
-    result = {}
-    if not path.exists():
-        return result
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        if key.startswith("export "):
-            key = key[7:].strip()
-        value = value.strip().strip('"').strip("'")
-        result[key] = value
-    return result
+    """resource_paths.env written by Step00 (shared parser in gwas2m_resources)."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import gwas2m_resources
+    return gwas2m_resources.load_resource_paths(root)
 
 
 # =============================================================================
 # CLI
 # =============================================================================
 
-def arguments():
+def arguments(argv=None):
     parser = argparse.ArgumentParser(
         description=(
             "Integrate Step07 fine-mapped/VEP variants with ALL-tissue "
@@ -285,11 +275,11 @@ def arguments():
         default=None,
         help="Run exactly one QTL_TASK_ID from the existing Step08 manifest.",
     )
-    parser.add_argument("--partition", default=DEFAULT_PARTITION)
-    parser.add_argument("--time", default=DEFAULT_TIME)
-    parser.add_argument("--memory", default=DEFAULT_MEMORY)
-    parser.add_argument("--cpus", type=int, default=DEFAULT_CPUS)
-    parser.add_argument("--max-parallel", type=int, default=DEFAULT_MAX_PARALLEL)
+    parser.add_argument("--partition", default=None)
+    parser.add_argument("--time", default=None)
+    parser.add_argument("--memory", default=None)
+    parser.add_argument("--cpus", type=int, default=None)
+    parser.add_argument("--max-parallel", type=int, default=None)
     parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE)
     parser.add_argument(
         "--gtex-root",
@@ -309,7 +299,9 @@ def arguments():
         action="store_true",
         help="Force rebuilding the shared all-tissue GTEx target cache.",
     )
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    gwas2m_config.apply_stage_defaults(args, "qtl")
+    return args
 
 
 def validate_arguments(args) -> None:
@@ -320,8 +312,8 @@ def validate_arguments(args) -> None:
         raise ValueError("--index must be >= 1")
     if args.cpus < 1:
         raise ValueError("--cpus must be >= 1")
-    if args.max_parallel < 1:
-        raise ValueError("--max-parallel must be >= 1")
+    if args.max_parallel < 0:
+        raise ValueError("--max-parallel must be >= 0 (0 = no throttle)")
     if args.chunk_size < 10_000:
         raise ValueError("--chunk-size must be >= 10000")
 
@@ -523,23 +515,12 @@ def load_step07_variants(path: Path) -> pd.DataFrame:
 
 
 # =============================================================================
-# PLANNER
+# GTEx RESOURCES + ONE QTL MANIFEST ROW
+# (shared by planner_mode and Step01_10_Run.py)
 # =============================================================================
 
-def planner_mode(args) -> None:
-    validate_arguments(args)
-
-    root = Path.cwd().resolve()
-    phenotype = args.phenotype.strip()
-    phenotype_slug = slugify(phenotype)
-    ancestry_code, ancestry_label = canonical_ancestry(args.ancestry)
-    ancestry_slug = slugify(ancestry_label)
-
-    pipeline_python = root / "envs" / "pipeline" / "bin" / "python"
-    if not pipeline_python.exists():
-        pipeline_python = Path(sys.executable).resolve()
-
-    gtex_root = resolve_gtex_root(root, args.gtex_root)
+def resolve_gtex_resources(root: Path, explicit: str | None) -> dict:
+    gtex_root = resolve_gtex_root(root, explicit)
     eqtl_root = gtex_root / "qtl" / "eQTL"
     sqtl_root = gtex_root / "qtl" / "sQTL"
     lookup_file = (
@@ -560,6 +541,91 @@ def planner_mode(args) -> None:
             f"No GTEx v11 sQTL significant-pair files found under:\n  {sqtl_root}"
         )
 
+    return {
+        "gtex_root": gtex_root,
+        "eqtl_root": eqtl_root,
+        "sqtl_root": sqtl_root,
+        "lookup_file": lookup_file,
+        "eqtl_files": eqtl_files,
+        "sqtl_files": sqtl_files,
+    }
+
+
+def build_qtl_row(
+    args,
+    task_id: int,
+    accession: str,
+    annotation_root: Path,
+    qtl_root: Path,
+    phenotype: str,
+    ancestry_code: str,
+    ancestry_label: str,
+    gtex: dict,
+) -> tuple[dict | None, dict | None]:
+    """Return (manifest_row, None) or (None, exclusion_record)."""
+    study_dir = annotation_root / accession
+    summary_file = study_dir / "annotation_summary.json"
+    summary = safe_read_json(summary_file)
+    variant_file = study_dir / f"{accession}_VEP_variant_summary.tsv"
+
+    reason = ""
+    if not summary:
+        reason = "Step07 annotation summary missing/unreadable"
+    elif str(summary.get("STATUS", "")).upper() != "COMPLETE":
+        reason = f"Step07 status is {summary.get('STATUS', 'UNKNOWN')}"
+    elif not variant_file.exists() or variant_file.stat().st_size == 0:
+        reason = "Step07 variant summary missing/empty"
+
+    if reason:
+        return None, {
+            "STUDY_ACCESSION": accession,
+            "STEP07_STATUS": summary.get("STATUS", ""),
+            "REASON": reason,
+        }
+
+    return {
+        "QTL_TASK_ID": task_id,
+        "STUDY_ACCESSION": accession,
+        "PHENOTYPE": phenotype,
+        "ANCESTRY_CODE": ancestry_code,
+        "ANCESTRY_LABEL": ancestry_label,
+        "STEP07_VARIANT_FILE": str(variant_file.resolve()),
+        "STEP07_SUMMARY_FILE": str(summary_file.resolve()),
+        "OUTPUT_DIR": str((qtl_root / accession).resolve()),
+        "GTEX_ROOT": str(gtex["gtex_root"].resolve()),
+        "GTEX_EQTL_ROOT": str(gtex["eqtl_root"].resolve()),
+        "GTEX_SQTL_ROOT": str(gtex["sqtl_root"].resolve()),
+        "GTEX_LOOKUP_FILE": str(gtex["lookup_file"].resolve()),
+        "CHUNK_SIZE": int(args.chunk_size),
+        "FORCE": bool(args.force),
+        "REBUILD_CACHE": bool(args.rebuild_cache),
+        "STEP08_VERSION": STEP08_VERSION,
+    }, None
+
+
+# =============================================================================
+# PLANNER
+# =============================================================================
+
+def planner_mode(args) -> None:
+    validate_arguments(args)
+
+    root = Path.cwd().resolve()
+    phenotype = args.phenotype.strip()
+    phenotype_slug = slugify(phenotype)
+    ancestry_code, ancestry_label = canonical_ancestry(args.ancestry)
+    ancestry_slug = slugify(ancestry_label)
+
+    pipeline_python = root / "envs" / "pipeline" / "bin" / "python"
+    if not pipeline_python.exists():
+        pipeline_python = Path(sys.executable).resolve()
+
+    gtex = resolve_gtex_resources(root, args.gtex_root)
+    gtex_root = gtex["gtex_root"]
+    lookup_file = gtex["lookup_file"]
+    eqtl_files = gtex["eqtl_files"]
+    sqtl_files = gtex["sqtl_files"]
+
     annotation_root = root / "07_annotation" / phenotype_slug / ancestry_slug
     if not annotation_root.exists():
         raise FileNotFoundError(
@@ -578,48 +644,24 @@ def planner_mode(args) -> None:
         if not study_dir.is_dir():
             continue
         accession = study_dir.name
-        summary_file = study_dir / "annotation_summary.json"
-        summary = safe_read_json(summary_file)
-        variant_file = study_dir / f"{accession}_VEP_variant_summary.tsv"
 
-        reason = ""
-        if not summary:
-            reason = "Step07 annotation summary missing/unreadable"
-        elif str(summary.get("STATUS", "")).upper() != "COMPLETE":
-            reason = f"Step07 status is {summary.get('STATUS', 'UNKNOWN')}"
-        elif not variant_file.exists() or variant_file.stat().st_size == 0:
-            reason = "Step07 variant summary missing/empty"
+        row, exclusion = build_qtl_row(
+            args,
+            task_id=len(rows) + 1,
+            accession=accession,
+            annotation_root=annotation_root,
+            qtl_root=qtl_root,
+            phenotype=phenotype,
+            ancestry_code=ancestry_code,
+            ancestry_label=ancestry_label,
+            gtex=gtex,
+        )
 
-        if reason:
-            excluded.append(
-                {
-                    "STUDY_ACCESSION": accession,
-                    "STEP07_STATUS": summary.get("STATUS", ""),
-                    "REASON": reason,
-                }
-            )
+        if exclusion is not None:
+            excluded.append(exclusion)
             continue
 
-        rows.append(
-            {
-                "QTL_TASK_ID": len(rows) + 1,
-                "STUDY_ACCESSION": accession,
-                "PHENOTYPE": phenotype,
-                "ANCESTRY_CODE": ancestry_code,
-                "ANCESTRY_LABEL": ancestry_label,
-                "STEP07_VARIANT_FILE": str(variant_file.resolve()),
-                "STEP07_SUMMARY_FILE": str(summary_file.resolve()),
-                "OUTPUT_DIR": str((qtl_root / accession).resolve()),
-                "GTEX_ROOT": str(gtex_root.resolve()),
-                "GTEX_EQTL_ROOT": str(eqtl_root.resolve()),
-                "GTEX_SQTL_ROOT": str(sqtl_root.resolve()),
-                "GTEX_LOOKUP_FILE": str(lookup_file.resolve()),
-                "CHUNK_SIZE": int(args.chunk_size),
-                "FORCE": bool(args.force),
-                "REBUILD_CACHE": bool(args.rebuild_cache),
-                "STEP08_VERSION": STEP08_VERSION,
-            }
-        )
+        rows.append(row)
 
     excluded_file = qtl_root / "qtl_excluded_studies.tsv"
     pd.DataFrame(
@@ -639,20 +681,20 @@ def planner_mode(args) -> None:
 
     bash_file = root / f"Step08_GTEx_QTL_{phenotype_slug}_{ancestry_slug}.sh"
     script_path = Path(__file__).resolve()
-    array_spec = f"1-{len(manifest)}"
+    array_spec = gwas2m_config.array_spec(len(manifest), args.max_parallel)
     job_name = f"GTEx_{phenotype_slug}_{ancestry_code.lower()}"[:100]
 
+    sbatch_header = gwas2m_config.sbatch_header_from_args(
+        args,
+        job_name=job_name,
+        output=f"{log_root}/qtl.%A_%a.out",
+        error=f"{log_root}/qtl.%A_%a.err",
+        array=array_spec,
+    )
+
+
     bash_text = f'''#!/bin/bash
-#SBATCH --job-name={job_name}
-#SBATCH --nodes=1
-#SBATCH --partition={args.partition}
-#SBATCH --time={args.time}
-#SBATCH --output={log_root}/qtl.%A_%a.out
-#SBATCH --error={log_root}/qtl.%A_%a.err
-#SBATCH --array={array_spec}
-#SBATCH --mem={args.memory}
-#SBATCH --cpus-per-task={args.cpus}
-#SBATCH --ntasks=1
+{sbatch_header}
 
 set -euo pipefail
 
@@ -1433,7 +1475,15 @@ def worker_mode() -> None:
             raise FileNotFoundError(f"Step07 variant file missing/empty: {input_file}")
 
         # qtl_root is the parent containing all study dirs + shared cache.
-        qtl_root = output_dir.parent
+        # STEP08_CACHE_ROOT (set by Step01_10_Run.py) gives each study worker
+        # its own cache directory, so independent per-study workers never
+        # rebuild/delete a cache another worker is reading. Results for a
+        # study are identical: cache rows are filtered per variant ID.
+        qtl_root = (
+            Path(os.environ["STEP08_CACHE_ROOT"]).resolve()
+            if os.environ.get("STEP08_CACHE_ROOT")
+            else output_dir.parent
+        )
         cache = ensure_shared_cache(
             manifest=manifest,
             qtl_root=qtl_root,

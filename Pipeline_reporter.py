@@ -19,6 +19,9 @@ One study:
         --ancestry EUR \
         --study GCST90129450
 
+Step01-10 run status only (from Step01_10_Run.py status files):
+    python Pipeline_reporter.py --phenotype migraine --ancestry EUR --status
+
 The report is intentionally different from dumping raw GWAS files.
 It prints:
   1. cross-study pipeline status
@@ -302,6 +305,104 @@ def study_paths(roots: dict[str, Path], study: str) -> dict[str, Path]:
         "STEP10": roots["STEP10"] / study,
         "STEP11": roots["STEP11"] / study,
     }
+
+
+# =============================================================================
+# STEP01-10 RUN STATUS (written by Step01_10_Run.py; only read here)
+# =============================================================================
+
+def print_step01_10_status(
+    root: Path,
+    phenotype: str,
+    ancestry_code: str,
+    ancestry_label: str,
+    phenotype_slug: str,
+    ancestry_slug: str,
+) -> bool:
+    import gwas2m_status as gs
+
+    audit = gs.audit_dir(root, phenotype_slug, ancestry_slug)
+
+    section("GWAS2m PIPELINE STATUS")
+    print(f"Phenotype: {phenotype}")
+    print(f"Ancestry : {ancestry_label} ({ancestry_code})")
+    print(f"Audit    : {audit}")
+
+    statuses = gs.read_all_statuses(audit)
+    if statuses.empty:
+        print("\n(no Step01_10_Run.py status files found for this phenotype/ancestry)")
+        return False
+    statuses = statuses.astype(object).where(statuses.notna(), None)
+
+    by_key = {
+        (row["study_accession"], row["stage"]): row
+        for _, row in statuses.iterrows()
+    }
+
+    manifest = safe_table(audit / "study_manifest.tsv")
+    if not manifest.empty:
+        studies = manifest["STUDY_ACCESSION"].astype(str).tolist()
+    else:
+        studies = sorted(
+            statuses.loc[statuses["stage"] != "Step01_Discovery", "study_accession"].unique()
+        )
+
+    study_stages = gs.STAGE_NAMES[1:]
+    width = max([len("STUDY")] + [len(s) for s in studies]) + 3
+
+    print()
+    print("STUDY".ljust(width) + "".join(gs.STAGE_CODES[s].ljust(7) for s in study_stages))
+    for study in studies:
+        cells = []
+        for stage in study_stages:
+            record = by_key.get((study, stage))
+            status = record["status"] if record is not None else ""
+            cell = gs.STATUS_SHORT.get(status, "?") if status else ""
+            cells.append(cell.ljust(7))
+        print(study.ljust(width) + "".join(cells))
+
+    print()
+    print(
+        "Legend: OK=complete/validated  PART=partial  FAIL=failed  EXCL=excluded  "
+        "N/A=not available  --=not run (upstream failed)  RUN=running  PEND=pending"
+    )
+
+    reasons = []
+    for study in studies:
+        for stage in study_stages:
+            record = by_key.get((study, stage))
+            if record is None or record["status"] in gs.DONE_STATUSES | {gs.PENDING, gs.RUNNING}:
+                continue
+            error = ""
+            if record.get("error_type"):
+                error = f"{record.get('error_type')}: {record.get('error_message') or ''}".strip()
+            reason = record.get("reason") or ""
+            reasons.append({
+                "STUDY": study,
+                "STAGE": stage,
+                "STATUS": record["status"],
+                "REASON": reason,
+                "ERROR": "" if error == reason else error,
+                "LOG": record.get("log_path") or "",
+            })
+    print_table(pd.DataFrame(reasons), "EXACT REASONS: FAILED / PARTIAL / EXCLUDED / NOT_AVAILABLE / NOT_RUN")
+
+    discovery = statuses[statuses["stage"] == "Step01_Discovery"]
+    excluded = discovery[discovery["status"] == gs.EXCLUDED]
+    if not discovery.empty:
+        print_table(
+            excluded.groupby("reason").size().reset_index(name="N_STUDIES")
+            if not excluded.empty else pd.DataFrame(),
+            f"STEP01 DISCOVERY: {len(discovery)} studies considered, "
+            f"{int((discovery['status'] == gs.COMPLETE).sum())} selected, "
+            f"{len(excluded)} excluded (by reason)",
+        )
+
+    summary = safe_table(audit / "study_summary.tsv")
+    if not summary.empty:
+        print_table(summary[["METRIC", "VALUE"]], "STUDY SUMMARY (pipeline_audit/study_summary.tsv)")
+
+    return True
 
 
 # =============================================================================
@@ -1473,12 +1574,32 @@ def main() -> None:
         ),
     )
 
+    parser.add_argument(
+        "--status",
+        action="store_true",
+        help=(
+            "Print only the Step01-10 run status grid and exact failure / "
+            "exclusion reasons written by Step01_10_Run.py."
+        ),
+    )
+
     args = parser.parse_args()
 
     root = Path.cwd().resolve()
     phenotype_slug = slugify(args.phenotype)
     ancestry_code, ancestry_label = canonical_ancestry(args.ancestry)
     ancestry_slug = slugify(ancestry_label)
+
+    if args.status:
+        print_step01_10_status(
+            root,
+            args.phenotype,
+            ancestry_code,
+            ancestry_label,
+            phenotype_slug,
+            ancestry_slug,
+        )
+        return
 
     roots = project_roots(
         root,

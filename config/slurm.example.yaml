@@ -1,0 +1,163 @@
+# =============================================================================
+# GWAS2m SLURM configuration - EXAMPLE / TEMPLATE (copy to config/slurm.yaml)
+#
+# The ONLY place SBATCH settings come from. Edit this file for your cluster;
+# no Python source needs to change. Alternate profiles can be passed with
+#   --slurm-config config/<profile>.yaml
+#
+# null site fields (partition/account/qos/reservation/constraint) produce NO
+# directive, so SLURM uses your site default.
+# max_parallel: 0  -> GWAS2m adds NO "%N" concurrency throttle to arrays
+#                     (your scheduler/account limits still apply).
+# array_limit      -> max indices in ONE array (not concurrency).
+# max_walltime     -> null = GWAS2m imposes no walltime ceiling.
+# Per-stage values below are defaults, not scientific requirements.
+# =============================================================================
+
+scheduler: slurm
+
+cluster:
+  name: generic_slurm
+
+slurm:
+  partition: null
+  account: null
+  qos: null
+  reservation: null
+  constraint: null
+
+  default_time: "24:00:00"
+  default_memory: "8G"
+  default_cpus: 1
+  default_nodes: 1
+  default_ntasks: 1
+
+  max_parallel: 0
+  array_limit: 1000
+  max_walltime: null
+
+  extra_sbatch_directives: []
+
+stages:
+
+  # ---- Step00 shared-resource setup jobs (fall back to "setup") ------------
+  setup:
+    time: "24:00:00"
+    memory: "16G"
+    cpus: 2
+  setup_genome:
+    time: "24:00:00"
+    memory: "24G"
+    cpus: 4
+  setup_gtex:
+    time: "48:00:00"
+    memory: "16G"
+    cpus: 2
+  setup_1000g_download:
+    time: "240:00:00"
+    memory: "12G"
+    cpus: 2
+  setup_1000g_all:
+    time: "120:00:00"
+    memory: "48G"
+    cpus: 4
+  setup_1000g_samples:
+    time: "01:00:00"
+    memory: "4G"
+    cpus: 1
+  setup_1000g_populations:
+    time: "120:00:00"
+    memory: "32G"
+    cpus: 4
+  setup_vep:
+    time: "48:00:00"
+    memory: "24G"
+    cpus: 4
+  setup_pangolin_db:
+    time: "12:00:00"
+    memory: "32G"
+    cpus: 4
+  setup_opentargets:
+    time: "72:00:00"
+    memory: "8G"
+    cpus: 2
+  setup_verify:
+    time: "01:00:00"
+    memory: "8G"
+    cpus: 1
+
+  # ---- Step01_10_Run.py: one array task = one GWAS study (Steps 02-10) -------
+  # Needs the maximum of the per-step requirements below (QC memory, FM CPUs).
+  study:
+    time: "24:00:00"
+    memory: "100G"
+    cpus: 8
+  audit:
+    time: "04:00:00"
+    memory: "8G"
+    cpus: 1
+
+  # ---- legacy per-step planners (Step01 ... Step10) ---------------------------
+  download:
+    time: "24:00:00"
+    memory: "8G"
+    cpus: 1
+  qc:
+    time: "24:00:00"
+    memory: "100G"
+    cpus: 4
+  ld:
+    time: "24:00:00"
+    memory: "32G"
+    cpus: 4
+  clumping:
+    time: "24:00:00"
+    memory: "16G"
+    cpus: 2
+  finemapping:
+    time: "24:00:00"
+    memory: "32G"
+    cpus: 4
+  vep:
+    time: "24:00:00"
+    memory: "16G"
+    cpus: 4
+  qtl:
+    time: "24:00:00"
+    memory: "16G"
+    cpus: 2
+  spliceai:
+    time: "24:00:00"
+    memory: "32G"
+    cpus: 4
+  pangolin:
+    time: "24:00:00"
+    memory: "32G"
+    cpus: 4
+
+  # ---- Step11 (scheduling only; Step11 science is unchanged) ------------------
+  coloc_discovery:
+    time: "08:00:00"
+    memory: "16G"
+    cpus: 2
+  coloc_planner:
+    time: "02:00:00"
+    memory: "16G"
+    cpus: 2
+  coloc_extraction:
+    time: "12:00:00"
+    memory: "32G"
+    cpus: 2
+  coloc:
+    time: "01:00:00"
+    memory: "8G"
+    cpus: 1
+  aggregation:
+    time: "01:00:00"
+    memory: "8G"
+    cpus: 1
+  # older standalone Step11_Colocalize_GTEx_SuSiE.py planner
+  coloc_core:
+    time: "24:00:00"
+    memory: "64G"
+    cpus: 4

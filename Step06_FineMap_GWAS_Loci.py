@@ -80,6 +80,7 @@ OUTPUT LAYOUT
                             susie_diagnostics.tsv
                             susie_fit.rds
                             susie_rss.log
+                        LOCUS_COMPLETE.json   # per-locus resume marker
                 <GCST>_finemapped_variants.tsv.gz
                 <GCST>_95pct_credible_sets.tsv
                 <GCST>_finemapping_summary.tsv
@@ -90,13 +91,16 @@ NOTES
 -----
 - Shared references under resources/1000G/<ANC>/ are reused; nothing is
   re-downloaded here.
-- Default SLURM partition: general.
-- Walltime is capped at 24 hours.
+- SLURM settings come from config/slurm.yaml (stage finemapping); CLI flags override.
+- Walltime is limited only by slurm.max_walltime when configured.
 - Planner is strict by default: Step 05 must be complete for all expected
   studies. Use --allow-incomplete only for exploratory/testing runs.
 - Effect statistics are accepted as Z, BETA+SE, OR+SE, or OR+95% CI.
   For OR-based studies, BETA is reconstructed as log(OR); when SE is absent
   but OR_95U/OR_95L are present, SE is reconstructed from the 95% CI.
+- Per-locus resume: when a study is re-run, loci whose LOCUS_COMPLETE.json
+  matches the current coordinates, input files and parameters are skipped and
+  their saved SuSiE outputs are reused; only failed/missing loci are re-run.
 - LD size protection is applied AFTER 1000G reference MAF/GENO filtering.
   If a locus is still larger than --max-ld-variants, a deterministic balanced
   subset nearest the independent lead signals is used, with sidecar audit files.
@@ -119,6 +123,9 @@ import traceback
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import gwas2m_config  # noqa: E402  (SLURM settings: config/slurm.yaml)
 from typing import Any
 from urllib.parse import urljoin
 
@@ -133,11 +140,9 @@ from urllib3.util.retry import Retry
 # DEFAULTS
 # =============================================================================
 
-DEFAULT_PARTITION = "general"
-DEFAULT_TIME = "24:00:00"
-DEFAULT_MEMORY = "64G"
+# SLURM partition/time/memory/CPUs/throttle come from config/slurm.yaml
+# (stage "finemapping"); command-line flags still override them.
 DEFAULT_CPUS = 8
-DEFAULT_MAX_PARALLEL = 2
 DEFAULT_LOCUS_WINDOW_KB = 1000
 DEFAULT_REFERENCE_MAF = 0.01
 DEFAULT_REFERENCE_GENO = 0.05
@@ -212,8 +217,10 @@ def parse_time_seconds(value: str) -> int:
     total = hours * 3600 + minutes * 60 + seconds
     if total <= 0:
         raise argparse.ArgumentTypeError("Walltime must be positive")
-    if total > 24 * 3600:
-        raise argparse.ArgumentTypeError("Maximum allowed walltime is 24 hours")
+    try:
+        gwas2m_config.validate_walltime(value)
+    except gwas2m_config.SlurmConfigError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
     return total
 
 
@@ -336,15 +343,15 @@ def run_command(command, log_file: Path | None = None) -> str:
 # =============================================================================
 
 
-def arguments():
+def arguments(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--phenotype", required=True)
     parser.add_argument("--ancestry", required=True)
-    parser.add_argument("--partition", default=DEFAULT_PARTITION)
-    parser.add_argument("--time", default=DEFAULT_TIME)
-    parser.add_argument("--memory", default=DEFAULT_MEMORY)
-    parser.add_argument("--cpus", type=int, default=DEFAULT_CPUS)
-    parser.add_argument("--max-parallel", type=int, default=DEFAULT_MAX_PARALLEL)
+    parser.add_argument("--partition", default=None)
+    parser.add_argument("--time", default=None)
+    parser.add_argument("--memory", default=None)
+    parser.add_argument("--cpus", type=int, default=None)
+    parser.add_argument("--max-parallel", type=int, default=None)
     parser.add_argument("--locus-window-kb", type=int, default=DEFAULT_LOCUS_WINDOW_KB)
     parser.add_argument("--reference-maf", type=float, default=DEFAULT_REFERENCE_MAF)
     parser.add_argument("--reference-geno", type=float, default=DEFAULT_REFERENCE_GENO)
@@ -373,10 +380,11 @@ def arguments():
         default=None,
         help="Last-resort sample-size fallback if official metadata cannot resolve N.",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    gwas2m_config.apply_stage_defaults(args, "finemapping")
     parse_time_seconds(args.time)
-    if args.cpus < 1 or args.max_parallel < 1:
-        parser.error("--cpus and --max-parallel must be >= 1")
+    if args.cpus < 1 or args.max_parallel < 0:
+        parser.error("--cpus must be >= 1 and --max-parallel >= 0 (0 = no throttle)")
     if args.locus_window_kb < 1:
         parser.error("--locus-window-kb must be >= 1")
     if not (0 < args.reference_maf < 0.5):
@@ -721,17 +729,13 @@ def count_reference_samples(root: Path, ancestry_code: str) -> int:
 
 
 # =============================================================================
-# PLANNER
+# TOOLS + ONE FINE-MAPPING MANIFEST ROW
+# (shared by planner_mode and Step01_10_Run.py)
 # =============================================================================
 
 
-def planner_mode(args) -> None:
-    root = Path.cwd().resolve()
-    phenotype = args.phenotype.strip()
-    phenotype_slug = slugify(phenotype)
-    ancestry_code, ancestry_label = resolve_ancestry(args.ancestry)
-    ancestry_slug = slugify(ancestry_label)
-
+def resolve_finemap_tools(root: Path) -> tuple[Path, Path, Path]:
+    """Return (pipeline_python, plink2, rscript) after verifying susieR."""
     pipeline_python = root / "envs" / "pipeline" / "bin" / "python"
     plink2 = root / "envs" / "pipeline" / "bin" / "plink2"
     rscript = root / "envs" / "pipeline" / "bin" / "Rscript"
@@ -754,6 +758,110 @@ def planner_mode(args) -> None:
     )
     if susie_check.returncode != 0:
         raise RuntimeError("R package susieR is not available in the configured R environment")
+
+    return pipeline_python, plink2, rscript
+
+
+def build_finemap_row(
+    args,
+    task_id: int,
+    accession: str,
+    qc_file: Path,
+    clump_root: Path,
+    output_root: Path,
+    metadata_root: Path,
+    step01_lookup: dict,
+    session: requests.Session,
+    reference_n: int,
+    rscript: Path,
+    plink2: Path,
+    phenotype: str,
+    ancestry_code: str,
+    ancestry_label: str,
+) -> tuple[dict | None, dict | None, list[str]]:
+    """Return (manifest_row, resolved_metadata, problems).
+
+    problems is empty when the study is ready; otherwise row is None.
+    """
+    study_clump_dir = clump_root / accession
+    lead_file = study_clump_dir / "lead_variants.tsv"
+    clump_summary = study_clump_dir / "clumping_summary.tsv"
+
+    missing = [
+        str(p) for p in (lead_file, clump_summary, qc_file)
+        if not p.exists() or p.stat().st_size == 0
+    ]
+    if missing:
+        return None, None, missing
+
+    srow = step01_lookup.get(accession)
+    download_url = str(srow.get("DOWNLOAD_URL", "")).strip() if srow is not None else ""
+    initial_sample = str(srow.get("INITIAL_SAMPLE_SIZE", "")).strip() if srow is not None else ""
+    ranking_n = safe_int(srow.get("RANKING_N")) if srow is not None else None
+
+    meta = resolve_official_metadata(
+        session=session,
+        accession=accession,
+        download_url=download_url or None,
+        initial_sample_text=initial_sample or None,
+        ranking_n=ranking_n,
+        metadata_dir=metadata_root / accession,
+        refresh=args.refresh_metadata,
+        user_fallback=args.sample_size,
+    )
+
+    if not meta["RESOLVED_GWAS_N"]:
+        return None, meta, ["GWAS sample size could not be resolved"]
+
+    study_output = output_root / accession
+    return (
+        {
+            "FINEMAP_TASK_ID": task_id,
+            "STUDY_ACCESSION": accession,
+            "PHENOTYPE": phenotype,
+            "ANCESTRY": ancestry_label,
+            "ANCESTRY_CODE": ancestry_code,
+            "ANCESTRY_LABEL": ancestry_label,
+            "QC_FILE": str(qc_file),
+            "LEAD_VARIANTS_FILE": str(lead_file.resolve()),
+            "CLUMPING_SUMMARY_FILE": str(clump_summary.resolve()),
+            "OUTPUT_DIR": str(study_output.resolve()),
+            "GWAS_N": int(meta["RESOLVED_GWAS_N"]),
+            "GWAS_N_SOURCE": meta["RESOLVED_GWAS_N_SOURCE"],
+            "N_CASES": meta.get("N_CASES") or "",
+            "N_CONTROLS": meta.get("N_CONTROLS") or "",
+            "REFERENCE_N": reference_n,
+            "LOCUS_WINDOW_KB": args.locus_window_kb,
+            "REFERENCE_MAF": args.reference_maf,
+            "REFERENCE_GENO": args.reference_geno,
+            "MIN_VARIANTS": args.min_variants,
+            "MAX_LD_VARIANTS": args.max_ld_variants,
+            "COVERAGE": args.coverage,
+            "SUSIE_L": args.susie_L,
+            "MAX_SUSIE_L": args.max_susie_L,
+            "LD_RIDGE": args.ld_ridge,
+            "CHUNK_SIZE": args.chunk_size,
+            "R_SCRIPT": str(rscript),
+            "PLINK2": str(plink2),
+        },
+        meta,
+        [],
+    )
+
+
+# =============================================================================
+# PLANNER
+# =============================================================================
+
+
+def planner_mode(args) -> None:
+    root = Path.cwd().resolve()
+    phenotype = args.phenotype.strip()
+    phenotype_slug = slugify(phenotype)
+    ancestry_code, ancestry_label = resolve_ancestry(args.ancestry)
+    ancestry_slug = slugify(ancestry_label)
+
+    pipeline_python, plink2, rscript = resolve_finemap_tools(root)
 
     verify_reference(root, ancestry_code)
     reference_n = count_reference_samples(root, ancestry_code)
@@ -801,72 +909,33 @@ def planner_mode(args) -> None:
 
     for _, crow in clump_manifest.iterrows():
         accession = str(crow["STUDY_ACCESSION"]).strip()
-        study_clump_dir = clump_root / accession
-        lead_file = study_clump_dir / "lead_variants.tsv"
-        clump_summary = study_clump_dir / "clumping_summary.tsv"
         qc_file = Path(str(crow["QC_FILE"])).resolve()
 
-        missing = [
-            str(p) for p in (lead_file, clump_summary, qc_file)
-            if not p.exists() or p.stat().st_size == 0
-        ]
-        if missing:
-            incomplete.append((accession, missing))
-            continue
-
-        srow = step01_lookup.get(accession)
-        download_url = str(srow.get("DOWNLOAD_URL", "")).strip() if srow is not None else ""
-        initial_sample = str(srow.get("INITIAL_SAMPLE_SIZE", "")).strip() if srow is not None else ""
-        ranking_n = safe_int(srow.get("RANKING_N")) if srow is not None else None
-
-        meta = resolve_official_metadata(
-            session=session,
+        row, meta, problems = build_finemap_row(
+            args,
+            task_id=len(rows) + 1,
             accession=accession,
-            download_url=download_url or None,
-            initial_sample_text=initial_sample or None,
-            ranking_n=ranking_n,
-            metadata_dir=metadata_root / accession,
-            refresh=args.refresh_metadata,
-            user_fallback=args.sample_size,
+            qc_file=qc_file,
+            clump_root=clump_root,
+            output_root=output_root,
+            metadata_root=metadata_root,
+            step01_lookup=step01_lookup,
+            session=session,
+            reference_n=reference_n,
+            rscript=rscript,
+            plink2=plink2,
+            phenotype=phenotype,
+            ancestry_code=ancestry_code,
+            ancestry_label=ancestry_label,
         )
-        metadata_rows.append(meta)
+        if meta is not None:
+            metadata_rows.append(meta)
 
-        if not meta["RESOLVED_GWAS_N"]:
-            incomplete.append((accession, ["GWAS sample size could not be resolved"]))
+        if problems:
+            incomplete.append((accession, problems))
             continue
 
-        study_output = output_root / accession
-        rows.append(
-            {
-                "FINEMAP_TASK_ID": len(rows) + 1,
-                "STUDY_ACCESSION": accession,
-                "PHENOTYPE": phenotype,
-                "ANCESTRY": ancestry_label,
-                "ANCESTRY_CODE": ancestry_code,
-                "ANCESTRY_LABEL": ancestry_label,
-                "QC_FILE": str(qc_file),
-                "LEAD_VARIANTS_FILE": str(lead_file.resolve()),
-                "CLUMPING_SUMMARY_FILE": str(clump_summary.resolve()),
-                "OUTPUT_DIR": str(study_output.resolve()),
-                "GWAS_N": int(meta["RESOLVED_GWAS_N"]),
-                "GWAS_N_SOURCE": meta["RESOLVED_GWAS_N_SOURCE"],
-                "N_CASES": meta.get("N_CASES") or "",
-                "N_CONTROLS": meta.get("N_CONTROLS") or "",
-                "REFERENCE_N": reference_n,
-                "LOCUS_WINDOW_KB": args.locus_window_kb,
-                "REFERENCE_MAF": args.reference_maf,
-                "REFERENCE_GENO": args.reference_geno,
-                "MIN_VARIANTS": args.min_variants,
-                "MAX_LD_VARIANTS": args.max_ld_variants,
-                "COVERAGE": args.coverage,
-                "SUSIE_L": args.susie_L,
-                "MAX_SUSIE_L": args.max_susie_L,
-                "LD_RIDGE": args.ld_ridge,
-                "CHUNK_SIZE": args.chunk_size,
-                "R_SCRIPT": str(rscript),
-                "PLINK2": str(plink2),
-            }
-        )
+        rows.append(row)
 
     if metadata_rows:
         pd.DataFrame(metadata_rows).to_csv(
@@ -901,20 +970,20 @@ def planner_mode(args) -> None:
 
     bash_file = root / f"Step06_FineMap_GWAS_{phenotype_slug}_{ancestry_slug}.sh"
     job_name = f"FM_{phenotype_slug}_{ancestry_code.lower()}"[:100]
-    array_spec = f"1-{len(manifest)}%{args.max_parallel}"
+    array_spec = gwas2m_config.array_spec(len(manifest), args.max_parallel)
     script_path = Path(__file__).resolve()
 
+    sbatch_header = gwas2m_config.sbatch_header_from_args(
+        args,
+        job_name=job_name,
+        output=f"{log_root}/finemap.%A_%a.out",
+        error=f"{log_root}/finemap.%A_%a.err",
+        array=array_spec,
+    )
+
+
     bash_text = f'''#!/bin/bash
-#SBATCH --job-name={job_name}
-#SBATCH --nodes=1
-#SBATCH --partition={args.partition}
-#SBATCH --time={args.time}
-#SBATCH --output={log_root}/finemap.%A_%a.out
-#SBATCH --error={log_root}/finemap.%A_%a.err
-#SBATCH --array={array_spec}
-#SBATCH --mem={args.memory}
-#SBATCH --cpus-per-task={args.cpus}
-#SBATCH --ntasks=1
+{sbatch_header}
 
 set -euo pipefail
 cd {shlex.quote(str(root))}
@@ -935,7 +1004,7 @@ printf '%s\n' "=============================================================="
     banner("PLANNING COMPLETE")
     print(f"Studies ready       : {len(manifest)}")
     print(f"Studies incomplete  : {len(incomplete)}")
-    print(f"Partition           : {args.partition}")
+    print(f"Partition           : {args.partition or 'scheduler default'}")
     print(f"Walltime            : {args.time}")
     print(f"Memory/task         : {args.memory}")
     print(f"CPUs/task           : {args.cpus}")
@@ -1745,6 +1814,119 @@ write.table(diagnostics, file.path(outdir,"susie_diagnostics.tsv"), sep="\t", qu
 
 
 # =============================================================================
+# PER-LOCUS RESUME
+#
+# A locus is skipped on rerun only if loci/<L>/LOCUS_COMPLETE.json exists,
+# its coordinates, input-file signatures and fine-mapping parameters all match
+# the current run, and the SuSiE outputs are present. Otherwise it is re-run.
+# =============================================================================
+
+LOCUS_COMPLETE_MARKER = "LOCUS_COMPLETE.json"
+LOCUS_REQUIRED_OUTPUTS = (
+    "susie_variants.tsv",
+    "susie_summary.tsv",
+    "susie_fit.rds",
+)
+
+
+def file_signature(path: Path) -> dict[str, Any]:
+    stat = path.stat()
+    return {"PATH": str(path), "SIZE": int(stat.st_size), "MTIME_NS": int(stat.st_mtime_ns)}
+
+
+def locus_identity(locus) -> dict[str, Any]:
+    return {
+        "LOCUS_ID": str(locus["LOCUS_ID"]),
+        "CHR": int(locus["CHR"]),
+        "LOCUS_START": int(locus["LOCUS_START"]),
+        "LOCUS_END": int(locus["LOCUS_END"]),
+        "N_INDEPENDENT_SIGNALS": int(locus["N_INDEPENDENT_SIGNALS"]),
+        "LEAD_POSITIONS": str(locus.get("LEAD_POSITIONS", "")),
+    }
+
+
+def read_valid_locus_marker(locus_dir: Path, locus, run_signature: dict) -> dict | None:
+    marker = locus_dir / LOCUS_COMPLETE_MARKER
+    if not marker.exists() or (locus_dir / "LOCUS_FAILED.txt").exists():
+        return None
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if payload.get("LOCUS") != locus_identity(locus):
+        return None
+    if payload.get("RUN_SIGNATURE") != run_signature:
+        return None
+    susie_dir = locus_dir / "susie"
+    for name in LOCUS_REQUIRED_OUTPUTS:
+        path = susie_dir / name
+        if not path.exists() or path.stat().st_size == 0:
+            return None
+    return payload
+
+
+def write_locus_marker(
+    locus_dir: Path,
+    locus,
+    run_signature: dict,
+    n_regional: int,
+    n_matched: int,
+) -> None:
+    payload = {
+        "LOCUS": locus_identity(locus),
+        "RUN_SIGNATURE": run_signature,
+        "N_REGIONAL_GWAS_VARIANTS": int(n_regional),
+        "N_MATCHED_VARIANTS": int(n_matched),
+        "COMPLETED_UTC": datetime.now(timezone.utc).isoformat(),
+    }
+    temporary = locus_dir / (LOCUS_COMPLETE_MARKER + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    os.replace(temporary, locus_dir / LOCUS_COMPLETE_MARKER)
+
+
+def read_locus_outputs(
+    susie_dir: Path,
+    accession: str,
+    phenotype: str,
+    ancestry_code: str,
+    locus_id: str,
+    chromosome: int,
+    start: int,
+    end: int,
+    n_signals: int,
+    n_regional: int,
+    n_matched: int,
+) -> tuple[pd.DataFrame, pd.DataFrame | None, pd.DataFrame]:
+    """Load one locus' SuSiE outputs exactly as the worker always has."""
+    variants = pd.read_csv(susie_dir / "susie_variants.tsv", sep="\t", low_memory=False)
+    variants.insert(0, "STUDY_ACCESSION", accession)
+    variants.insert(1, "PHENOTYPE", phenotype)
+    variants.insert(2, "ANCESTRY_CODE", ancestry_code)
+    variants.insert(3, "LOCUS_ID", locus_id)
+
+    cs = None
+    cs_path = susie_dir / "credible_sets.tsv"
+    if cs_path.exists() and cs_path.stat().st_size > 0:
+        cs = pd.read_csv(cs_path, sep="\t", low_memory=False)
+        if not cs.empty:
+            cs.insert(0, "STUDY_ACCESSION", accession)
+            cs.insert(1, "PHENOTYPE", phenotype)
+            cs.insert(2, "ANCESTRY_CODE", ancestry_code)
+        else:
+            cs = None
+
+    s = pd.read_csv(susie_dir / "susie_summary.tsv", sep="\t", low_memory=False)
+    s.insert(0, "STUDY_ACCESSION", accession)
+    s["CHR"] = chromosome
+    s["LOCUS_START"] = start
+    s["LOCUS_END"] = end
+    s["N_INDEPENDENT_SIGNALS"] = n_signals
+    s["N_REGIONAL_GWAS_VARIANTS"] = n_regional
+    s["N_MATCHED_VARIANTS"] = n_matched
+    return variants, cs, s
+
+
+# =============================================================================
 # WORKER
 # =============================================================================
 
@@ -1790,6 +1972,9 @@ def worker_mode() -> None:
     plink2 = Path(row["PLINK2"]).resolve()
     rscript = Path(row["R_SCRIPT"]).resolve()
     threads = int(os.environ.get("SLURM_CPUS_PER_TASK", DEFAULT_CPUS))
+    # Optional column (Step01_10_Run.py sets it when an upstream stage was
+    # re-run); planner manifests do not contain it.
+    force = str(row.get("FORCE", "False")).strip().lower() in {"true", "1", "yes", "y"}
 
     final_variants = output_dir / f"{accession}_finemapped_variants.tsv.gz"
     final_cs = output_dir / f"{accession}_95pct_credible_sets.tsv"
@@ -1798,7 +1983,7 @@ def worker_mode() -> None:
     summary_json = output_dir / "finemapping_summary.json"
     hard_failure = output_dir / "FINEMAPPING_FAILED.txt"
 
-    if final_variants.exists() and final_summary.exists() and summary_json.exists() and not hard_failure.exists():
+    if not force and final_variants.exists() and final_summary.exists() and summary_json.exists() and not hard_failure.exists():
         banner("FINEMAPPING ALREADY COMPLETE")
         print(accession)
         return
@@ -1887,7 +2072,42 @@ def worker_mode() -> None:
         regional_dir = output_dir / "regional_gwas"
         locus_root = output_dir / "loci"
         locus_root.mkdir(parents=True, exist_ok=True)
-        regional_paths = extract_regional_gwas_once(qc_file, loci, regional_dir, chunk_size)
+
+        # Per-locus resume: everything that can change a locus result.
+        run_signature = {
+            "QC_FILE": file_signature(qc_file),
+            "LEAD_VARIANTS_FILE": file_signature(lead_file),
+            "GWAS_N": gwas_n,
+            "REFERENCE_N": reference_n,
+            "LOCUS_WINDOW_KB": locus_window_kb,
+            "REFERENCE_MAF": reference_maf,
+            "REFERENCE_GENO": reference_geno,
+            "MIN_VARIANTS": min_variants,
+            "MAX_LD_VARIANTS": max_ld_variants,
+            "COVERAGE": coverage,
+            "SUSIE_L": susie_l,
+            "MAX_SUSIE_L": max_susie_l,
+            "LD_RIDGE": ld_ridge,
+            "ESTIMATE_S_MAX": DEFAULT_ESTIMATE_S_MAX,
+        }
+        completed_loci = {}
+        for _, locus in loci.iterrows():
+            marker = read_valid_locus_marker(
+                locus_root / str(locus["LOCUS_ID"]), locus, run_signature
+            )
+            if marker is not None:
+                completed_loci[str(locus["LOCUS_ID"])] = marker
+        pending_loci = loci[~loci["LOCUS_ID"].astype(str).isin(completed_loci)]
+        print(f"Loci validated  : {len(completed_loci)} (skipped)")
+        print(f"Loci to run     : {len(pending_loci)}")
+
+        # Regions are extracted independently per locus, so extracting only
+        # the pending loci gives identical regional files for those loci.
+        regional_paths = (
+            extract_regional_gwas_once(qc_file, pending_loci, regional_dir, chunk_size)
+            if not pending_loci.empty
+            else {}
+        )
         r_helper = write_susie_r_script(output_dir / "run_susie_rss.R")
 
         fine_frames = []
@@ -1903,6 +2123,25 @@ def worker_mode() -> None:
             n_signals = int(locus["N_INDEPENDENT_SIGNALS"])
             locus_dir = locus_root / locus_id
             locus_dir.mkdir(parents=True, exist_ok=True)
+
+            if locus_id in completed_loci:
+                marker = completed_loci[locus_id]
+                print(f"[SKIP] {locus_id}: output already validated")
+                variants, cs, s = read_locus_outputs(
+                    locus_dir / "susie", accession, phenotype, ancestry_code,
+                    locus_id, chromosome, start, end, n_signals,
+                    marker["N_REGIONAL_GWAS_VARIANTS"], marker["N_MATCHED_VARIANTS"],
+                )
+                fine_frames.append(variants)
+                if cs is not None:
+                    cs_frames.append(cs)
+                summary_frames.append(s)
+                continue
+
+            stale_marker = locus_dir / LOCUS_COMPLETE_MARKER
+            if stale_marker.exists():
+                stale_marker.unlink()
+
             try:
                 regional = pd.read_csv(regional_paths[locus_id], sep="\t", compression="infer", low_memory=False)
                 if len(regional) < min_variants:
@@ -1960,35 +2199,23 @@ def worker_mode() -> None:
                     susie_dir / "r_command.log",
                 )
 
-                variants = pd.read_csv(susie_dir / "susie_variants.tsv", sep="\t", low_memory=False)
-                variants.insert(0, "STUDY_ACCESSION", accession)
-                variants.insert(1, "PHENOTYPE", phenotype)
-                variants.insert(2, "ANCESTRY_CODE", ancestry_code)
-                variants.insert(3, "LOCUS_ID", locus_id)
+                variants, cs, s = read_locus_outputs(
+                    susie_dir, accession, phenotype, ancestry_code,
+                    locus_id, chromosome, start, end, n_signals,
+                    len(regional), len(matched),
+                )
                 fine_frames.append(variants)
-
-                cs_path = susie_dir / "credible_sets.tsv"
-                if cs_path.exists() and cs_path.stat().st_size > 0:
-                    cs = pd.read_csv(cs_path, sep="\t", low_memory=False)
-                    if not cs.empty:
-                        cs.insert(0, "STUDY_ACCESSION", accession)
-                        cs.insert(1, "PHENOTYPE", phenotype)
-                        cs.insert(2, "ANCESTRY_CODE", ancestry_code)
-                        cs_frames.append(cs)
-
-                s = pd.read_csv(susie_dir / "susie_summary.tsv", sep="\t", low_memory=False)
-                s.insert(0, "STUDY_ACCESSION", accession)
-                s["CHR"] = chromosome
-                s["LOCUS_START"] = start
-                s["LOCUS_END"] = end
-                s["N_INDEPENDENT_SIGNALS"] = n_signals
-                s["N_REGIONAL_GWAS_VARIANTS"] = len(regional)
-                s["N_MATCHED_VARIANTS"] = len(matched)
+                if cs is not None:
+                    cs_frames.append(cs)
                 summary_frames.append(s)
 
                 locus_failure_marker = locus_dir / "LOCUS_FAILED.txt"
                 if locus_failure_marker.exists():
                     locus_failure_marker.unlink()
+
+                write_locus_marker(
+                    locus_dir, locus, run_signature, len(regional), len(matched)
+                )
 
             except Exception as exc:
                 failure_text = f"{type(exc).__name__}: {exc}"

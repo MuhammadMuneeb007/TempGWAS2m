@@ -40,9 +40,21 @@ Submit shared resources only:
 
     python Step00_Check_Resources.py --resources-only
 
-Check status only:
+Inspect only (READ-ONLY: never installs, downloads, deletes, writes or submits):
 
-    python Step00_Check_Resources.py --status
+    python Step00_Check_Resources.py --inspect
+    python Step00_Check_Resources.py --inspect --ancestry EUR
+    python Step00_Check_Resources.py --inspect --through-step 11
+    python Step00_Check_Resources.py --inspect --json
+    python Step00_Check_Resources.py --inspect --json --output resource_inspection.json
+
+    (--status is an alias for --inspect.)
+
+Step00 is the single authority for shared software and resources. The
+registry lives in gwas2m_resources.py; SLURM settings come only from
+config/slurm.yaml (or --slurm-config FILE). Scientific steps consume these
+resources and never install or download them. Phenotype-specific GWAS summary
+statistics are runtime inputs (Step01 selects, Step02 downloads).
 
 ===============================================================================
 """
@@ -96,43 +108,299 @@ REFERENCE_PANEL = "1000G_GRCh38_20190312"
 
 
 # =============================================================================
-# SLURM DEFAULTS
+# ARGUMENTS (parsed first so that --inspect never reaches any writing code)
 # =============================================================================
 
-def detect_slurm_partition() -> str:
-    """Prefer SLURM_PARTITION; otherwise use UQ ascher when present; else default."""
-    explicit = os.environ.get("SLURM_PARTITION", "").strip()
-    if explicit:
-        return explicit
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-    sinfo = shutil.which("sinfo")
-    if sinfo:
-        try:
-            result = subprocess.run(
-                [sinfo, "-h", "-o", "%P"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                timeout=20,
-                check=False,
-            )
-            names = {x.strip().rstrip("*") for x in result.stdout.splitlines()}
-            if "ascher" in names:
-                return "ascher"
-        except Exception:
-            pass
+import gwas2m_config  # noqa: E402
+import gwas2m_resources  # noqa: E402
 
-    return ""
+parser = argparse.ArgumentParser(
+    description="Install software, prepare reproducible resources, and verify the GWAS mechanism pipeline."
+)
+
+parser.add_argument("--inspect", action="store_true",
+                    help="READ-ONLY: report software, packages, resources, SLURM config and readiness.")
+parser.add_argument("--status", action="store_true",
+                    help="Alias for --inspect (read-only).")
+parser.add_argument("--json", action="store_true",
+                    help="With --inspect: print machine-readable JSON to stdout.")
+parser.add_argument("--output", default=None,
+                    help="With --inspect: also write the JSON report to this file (explicit write).")
+parser.add_argument("--ancestry", default=None,
+                    help="With --inspect: only require the LD panel of this ancestry (EUR, AFR, EAS, SAS, AMR).")
+parser.add_argument("--through-step", type=int, default=10,
+                    help="With --inspect: readiness for Steps01..N (default 10; 11 adds colocalisation resources).")
+parser.add_argument("--slurm-config", default=None,
+                    help="SLURM configuration file (default config/slurm.yaml).")
+parser.add_argument("--record-versions", action="store_true",
+                    help="Write setup_manifests/resource_versions.tsv from the current state and exit.")
+parser.add_argument("--generate-only", action="store_true",
+                    help="Generate setup files only; do not install or submit anything.")
+parser.add_argument("--install-only", action="store_true",
+                    help="Install/repair software only; do not submit resource jobs.")
+parser.add_argument("--resources-only", action="store_true",
+                    help="Skip software installation and submit resource jobs only.")
+parser.add_argument("--no-submit", action="store_true",
+                    help="Backward-compatible alias for --install-only.")
+parser.add_argument("--submit", action="store_true", help=argparse.SUPPRESS)
+
+args = parser.parse_args()
+if args.install_only and args.resources_only:
+    parser.error("--install-only and --resources-only cannot be used together")
+if args.slurm_config:
+    os.environ[gwas2m_config.CONFIG_ENV_VAR] = str(Path(args.slurm_config).resolve())
 
 
-PARTITION = detect_slurm_partition()
-SBATCH_PARTITION = f"#SBATCH --partition={PARTITION}" if PARTITION else ""
+# =============================================================================
+# READ-ONLY INSPECTION
+# =============================================================================
 
-DOWNLOAD_MAX_PARALLEL = 6
+INSPECT_STAGES = [
+    "setup", "setup_genome", "setup_gtex", "setup_1000g_download", "setup_1000g_all",
+    "setup_1000g_samples", "setup_1000g_populations", "setup_vep", "setup_pangolin_db",
+    "setup_opentargets", "setup_verify", "study", "audit", "download", "qc", "ld", "clumping",
+    "finemapping", "vep", "qtl", "spliceai", "pangolin", "coloc_discovery", "coloc_planner",
+    "coloc_extraction", "coloc", "aggregation",
+]
 
-PGEN_MAX_PARALLEL = 8
 
-POPULATION_MAX_PARALLEL = 12
+def slurm_inspection() -> dict:
+    commands = {name: ("AVAILABLE" if path else "MISSING")
+                for name, path in gwas2m_config.scheduler_commands().items()}
+    path = gwas2m_config.resolve_config_path(ROOT)
+    try:
+        config = gwas2m_config.load_slurm_config(ROOT)
+        record = gwas2m_config.effective_config_record(config, INSPECT_STAGES)
+        record.update({"status": "VALID", "errors": []})
+    except (gwas2m_config.SlurmConfigError, OSError) as exc:
+        record = {"status": "INVALID", "errors": str(exc).splitlines(), "config_file": str(path)}
+    record["commands"] = commands
+    record["environment"] = "SLURM MACHINE" if commands["sbatch"] == "AVAILABLE" else "NON-SLURM MACHINE"
+    return record
+
+
+def _short(path) -> str:
+    if not path:
+        return ""
+    try:
+        return str(Path(path).resolve().relative_to(ROOT))
+    except ValueError:
+        return str(path)
+
+
+def _human(size) -> str:
+    if not size:
+        return ""
+    for unit in ("B", "K", "M", "G", "T"):
+        if size < 1024:
+            return f"{size:.0f}{unit}"
+        size /= 1024
+    return f"{size:.1f}P"
+
+
+def print_inspection(report: dict) -> None:
+    line = "=" * 100
+    dash = "-" * 100
+
+    def section(title):
+        print()
+        print(dash)
+        print(title)
+        print(dash)
+
+    print(line)
+    print("GWAS2m RESOURCE INSPECTION (read-only)")
+    print(line)
+    print(f"\nProject root   : {report['project_root']}")
+    print(f"Reference build: {report['reference_build']}")
+    print(f"Ancestry       : {report['ancestry'] or 'ALL (global inspection)'}")
+    print(f"Readiness for  : Steps01-{report['through_step']:02d}")
+
+    section("ENVIRONMENTS")
+    print(f"{'ENVIRONMENT':<14}{'STATUS':<18}PATH")
+    for name, r in report["environments"].items():
+        print(f"{name:<14}{r['status']:<18}{_short(r['path'])}")
+
+    section("SOFTWARE")
+    print(f"{'RESOURCE':<32}{'STATUS':<18}{'VERSION':<44}PATH")
+    for name, r in report["software"].items():
+        print(f"{name:<32}{r['status']:<18}{str(r.get('version') or '')[:42]:<44}{_short(r.get('path'))}")
+
+    section("PYTHON PACKAGES")
+    pipeline_python = str(ROOT / "envs" / "pipeline" / "bin" / "python")
+    probed = {r.get("interpreter") for r in report["python_packages"].values() if r["env"] == "pipeline"}
+    if probed and probed != {pipeline_python}:
+        print(f"NOTE: envs/pipeline is missing; 'pipeline' packages were probed in {', '.join(sorted(probed))}\n")
+    print(f"{'PACKAGE':<26}{'STATUS':<18}{'VERSION':<16}{'REQUIRED':<10}USED BY")
+    for name, r in report["python_packages"].items():
+        required = "YES" if r["required"] else "no"
+        print(f"{name:<26}{r['status']:<18}{str(r.get('version') or ''):<16}{required:<10}{r['used_by']}")
+
+    section("R PACKAGES")
+    print(f"{'PACKAGE':<26}{'STATUS':<18}VERSION")
+    for name, r in report["r_packages"].items():
+        print(f"{name:<26}{r['status']:<18}{r.get('version') or ''}")
+
+    section("REFERENCE RESOURCES (shared; installed once, reused by every phenotype)")
+    print(f"{'RESOURCE':<34}{'STATUS':<18}{'SIZE':<9}{'DETAIL':<44}PATH")
+    for name, r in report["resources"].items():
+        print(f"{name:<34}{r['status']:<18}{_human(r.get('size_bytes')):<9}"
+              f"{str(r.get('detail') or '')[:42]:<44}{_short(r.get('path'))}")
+    env = report["resource_paths_env"]
+    print(f"\nresource_paths.env : {'present' if env['exists'] else 'MISSING (generated by setup)'}")
+
+    slurm = report["slurm"]
+    section("SLURM CONFIGURATION")
+    print(f"Config file     : {_short(slurm.get('config_file'))}")
+    if slurm["status"] == "INVALID":
+        print("SLURM CONFIGURATION : INVALID")
+        for error in slurm["errors"]:
+            print(f"  {error}")
+    else:
+        s = slurm["slurm"]
+        print(f"Scheduler       : {str(slurm['scheduler']).upper()}")
+        print(f"Source          : {slurm['config_source']}")
+        print(f"Cluster name    : {slurm['cluster_name']}")
+        for key in ("partition", "account", "qos", "reservation", "constraint"):
+            print(f"{key.capitalize():<16}: {gwas2m_config.describe(s.get(key))}")
+        print(f"Array limit     : {s['array_limit']}")
+        print(f"Concurrency cap : {s['max_parallel'] if s.get('max_parallel') else 'NONE'}")
+        print(f"Max walltime    : {s.get('max_walltime') or 'NONE (not enforced by GWAS2m)'}")
+        print(f"Default time    : {s['default_time']}")
+        print(f"Default memory  : {s['default_memory']}")
+        print(f"Default CPUs    : {s['default_cpus']}")
+        print(f"Extra directives: {', '.join(slurm['extra_sbatch_directives']) or 'none'}")
+    print("\nScheduler commands:")
+    for name, status in slurm["commands"].items():
+        print(f"  {name:<7}: {status}")
+    print(f"Environment     : {slurm['environment']}")
+
+    if slurm["status"] == "VALID":
+        section("STAGE RESOURCES (effective SBATCH requests)")
+        print(f"{'STAGE':<26}{'TIME':<12}{'MEMORY':<9}{'CPUS':<6}{'THROTTLE':<10}{'PARTITION':<18}FROM")
+        for stage, r in slurm["stages"].items():
+            print(f"{stage:<26}{r['time']:<12}{r['memory']:<9}{r['cpus']:<6}"
+                  f"{(str(r['max_parallel']) if r['max_parallel'] else 'none'):<10}"
+                  f"{gwas2m_config.describe(r.get('partition'), 'default'):<18}"
+                  f"{'stages.' + r['config_stage'] if r['config_stage'] else 'slurm defaults'}")
+
+    print()
+    print(line)
+    print("SUMMARY")
+    print(line)
+    for title, key in (("Software", "software"), ("Python packages", "python_packages"),
+                       ("R packages", "r_packages"), ("Resources", "resources")):
+        counts = {}
+        for r in report[key].values():
+            counts[r["status"]] = counts.get(r["status"], 0) + 1
+        print(f"{title + ':':<17}" + "  ".join(f"{k}={v}" for k, v in sorted(counts.items())))
+
+    label = report["ancestry"] or "ALL-ANCESTRY"
+    print(f"\nPIPELINE READY FOR {label} STEPS01-{report['through_step']:02d}: "
+          f"{'YES' if report['pipeline_ready'] else 'NO'}")
+    if report.get("ancestry_readiness"):
+        for anc, ready in report["ancestry_readiness"].items():
+            print(f"  PIPELINE READY FOR {anc} STEPS01-{report['through_step']:02d}: {'YES' if ready else 'NO'}")
+    if report["missing_required"]:
+        print("\nBLOCKING:")
+        for item in report["missing_required"]:
+            print(f"  - {item}")
+    if report["warnings"]:
+        print("\nWARNINGS:")
+        for item in report["warnings"]:
+            print(f"  - {item}")
+    if report["setup_inputs_missing"]:
+        print("\nSetup inputs missing (needed only to build shared resources):")
+        for item in report["setup_inputs_missing"]:
+            print(f"  - {item}")
+    if report["missing_optional"]:
+        print("\nOptional / not needed for this readiness check:")
+        for item in report["missing_optional"]:
+            print(f"  - {item}")
+    if not report["pipeline_ready"] or report["setup_inputs_missing"]:
+        print("\nSetup actions:")
+        print("  python Step00_Check_Resources.py                   # full idempotent setup")
+        print("  python Step00_Check_Resources.py --install-only    # software only")
+        print("  python Step00_Check_Resources.py --resources-only  # shared resources only")
+    if slurm["status"] == "INVALID":
+        print("\nSLURM configuration is INVALID; fix it before submitting any job.")
+
+
+if args.inspect or args.status:
+    report = gwas2m_resources.inspect_pipeline(ROOT, args.ancestry, args.through_step)
+    report["slurm"] = slurm_inspection()
+    if args.json:
+        print(json.dumps(report, indent=2, default=str))
+    else:
+        print_inspection(report)
+    if args.output:
+        Path(args.output).write_text(json.dumps(report, indent=2, default=str) + "\n", encoding="utf-8")
+        if not args.json:
+            print(f"\nJSON report written to: {args.output}")
+    sys.exit(0 if report["pipeline_ready"] and report["slurm"]["status"] == "VALID" else 1)
+
+
+# =============================================================================
+# SLURM CONFIGURATION (config/slurm.yaml; no cluster-specific defaults)
+# =============================================================================
+
+try:
+    SLURM_CONFIG = gwas2m_config.load_slurm_config(ROOT)
+except gwas2m_config.SlurmConfigError as exc:
+    print(f"SLURM CONFIGURATION : INVALID\n{exc}")
+    sys.exit(2)
+
+
+def sbatch_header(stage: str, job_name: str, log_name: str, array_tasks: int | None = None) -> str:
+    resources = gwas2m_config.get_stage_resources(stage, SLURM_CONFIG)
+    array = gwas2m_config.array_spec(array_tasks, resources["max_parallel"]) if array_tasks else None
+    pattern = "%A_%a" if array else "%j"
+    return gwas2m_config.build_sbatch_directives(
+        stage,
+        job_name=job_name,
+        output=f"{LOGS}/{log_name}.{pattern}.out",
+        error=f"{LOGS}/{log_name}.{pattern}.err",
+        array=array,
+        config=SLURM_CONFIG,
+    )
+
+
+def write_resource_versions() -> Path:
+    """setup_manifests/resource_versions.tsv: versions/releases actually present."""
+    report = gwas2m_resources.inspect_pipeline(ROOT)
+    rows = []
+    for section, category in (("software", "SOFTWARE"), ("python_packages", "PYTHON_PACKAGE"),
+                              ("r_packages", "R_PACKAGE")):
+        for name, r in report[section].items():
+            rows.append([category, name, r["status"], r.get("version") or "", "", "", r.get("path") or "", "", ""])
+    for name, r in report["resources"].items():
+        sig = gwas2m_status_signature(r.get("path"))
+        rows.append(["RESOURCE", name, r["status"], r.get("version") or "", r.get("build") or "",
+                     r.get("source") or "", r.get("path") or "", r.get("size_bytes") or "",
+                     f"url={r.get('url')}; modified={sig}"])
+    MANIFESTS.mkdir(parents=True, exist_ok=True)
+    path = MANIFESTS / "resource_versions.tsv"
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle, delimiter="\t")
+        writer.writerow(["CATEGORY", "NAME", "STATUS", "VERSION_OR_RELEASE", "GENOME_BUILD", "SOURCE",
+                         "PATH", "SIZE_BYTES", "PROVENANCE"])
+        writer.writerows(rows)
+    return path
+
+
+def gwas2m_status_signature(path) -> str:
+    try:
+        from datetime import datetime, timezone
+        return datetime.fromtimestamp(Path(path).stat().st_mtime, timezone.utc).isoformat()
+    except Exception:
+        return ""
+
+
+if args.record_versions:
+    print(f"Recorded: {write_resource_versions()}")
+    sys.exit(0)
 
 
 # =============================================================================
@@ -294,6 +562,7 @@ dependencies:
   - python=3.11
 
   # Core Python scientific stack
+  # (single source of truth: gwas2m_resources.PYTHON_PACKAGES)
   - pandas
   - numpy
   - scipy
@@ -305,9 +574,14 @@ dependencies:
   - statsmodels
   - matplotlib
   - requests
+  - urllib3
   - httpx
   - tenacity
   - tqdm
+  - orjson
+  - pyyaml
+  - networkx
+  - gprofiler-official
 
   # Genomics
   - plink2
@@ -337,6 +611,11 @@ dependencies:
   # General
   - git
   - pip
+
+  # pip-only packages (also installed explicitly by Setup_00_Install_Software.sh)
+  - pip:
+      - gwaslab==4.2.3
+      - polars[rtcompat]
 """
 
 write_file(
@@ -346,30 +625,12 @@ write_file(
 
 
 # =============================================================================
-# SOFTWARE MANIFEST
+# SOFTWARE MANIFEST (from gwas2m_resources; not a lock file - versions are
+# pinned only where SPECIFICATION says so)
 # =============================================================================
 
-software_manifest = [
-    ["plink2", "mamba", "plink2"],
-    ["bcftools", "mamba", "bcftools"],
-    ["tabix", "mamba", "htslib"],
-    ["bgzip", "mamba", "htslib"],
-    ["samtools", "mamba", "samtools"],
-    ["bedtools", "mamba", "bedtools"],
-    ["aria2c", "mamba", "aria2"],
-    ["rsync", "mamba", "rsync"],
-    ["VEP", "mamba", f"ensembl-vep={VEP_RELEASE}"],
-    ["GWASLab", "pip", "gwaslab==4.2.3"],
-    ["Polars", "pip", "polars[rtcompat]"],
-    ["SuSiE-RSS", "mamba", "r-susier"],
-    ["coloc", "mamba", "r-coloc"],
-    ["data.table", "mamba", "r-data.table"],
-    ["SpliceAI", "pip-isolated-env", "spliceai"],
-    ["Pangolin", "git+isolated-env", "tkzeng/Pangolin"],
-]
-
 with open(
-    MANIFESTS / "software.lock.tsv",
+    MANIFESTS / "software_manifest.tsv",
     "w",
     newline="",
     encoding="utf-8",
@@ -382,13 +643,55 @@ with open(
 
     writer.writerow([
         "SOFTWARE",
+        "TYPE",
         "INSTALL_METHOD",
         "SPECIFICATION",
+        "EXPECTED_ENV",
+        "REQUIRED",
+        "FIRST_STEP",
+        "VERSION_PINNED",
     ])
 
-    writer.writerows(
-        software_manifest
+    for env_id, rel, step, purpose, method in gwas2m_resources.ENVIRONMENTS:
+        writer.writerow([env_id, "environment", method, rel, env_id, "YES", step, "NO"])
+    for name, env, _, required, step, purpose, spec in gwas2m_resources.TOOLS:
+        writer.writerow([name, "external-tool", "conda/pip/git", spec, env,
+                         "YES" if required else "NO", step or "setup", "YES" if "=" in spec else "NO"])
+    for module, dist, env, required, step, method, spec, used in gwas2m_resources.PYTHON_PACKAGES:
+        writer.writerow([dist, "python-package", method, spec, env,
+                         "YES" if required else "NO", step or "-", "YES" if "==" in spec else "NO"])
+    for name, required, step, spec, used in gwas2m_resources.R_PACKAGES:
+        writer.writerow([name, "r-package", "conda", spec, "pipeline",
+                         "YES" if required else "NO", step, "NO"])
+
+
+# =============================================================================
+# CENTRAL RESOURCE MANIFEST (from gwas2m_resources.RESOURCES)
+# =============================================================================
+
+with open(
+    MANIFESTS / "resources.tsv",
+    "w",
+    newline="",
+    encoding="utf-8",
+) as handle:
+
+    writer = csv.writer(
+        handle,
+        delimiter="\t",
     )
+
+    writer.writerow([
+        "RESOURCE_ID", "RESOURCE_TYPE", "SOURCE", "VERSION", "GENOME_BUILD", "URL",
+        "EXPECTED_PATH", "REQUIRED", "FIRST_STEP", "ANCESTRY", "VALIDATION_METHOD", "SETUP",
+    ])
+
+    for item in gwas2m_resources.RESOURCES:
+        writer.writerow([
+            item["id"], item["type"], item["source"], item["version"], item["build"], item["url"],
+            item["path"], "YES" if item["required"] else "NO", item["step"] or "setup",
+            item["ancestry"] or "", item["validation"], item["setup"],
+        ])
 
 
 # =============================================================================
@@ -517,31 +820,6 @@ resource_rows = [
 ]
 
 
-with open(
-    MANIFESTS / "resources.lock.tsv",
-    "w",
-    newline="",
-    encoding="utf-8",
-) as handle:
-
-    writer = csv.writer(
-        handle,
-        delimiter="\t",
-    )
-
-    writer.writerow([
-        "RESOURCE",
-        "VERSION",
-        "BUILD",
-        "SOURCE_URL",
-        "LOCAL_PATH",
-    ])
-
-    writer.writerows(
-        resource_rows
-    )
-
-
 # =============================================================================
 # GTEx ARRAY MANIFEST
 # =============================================================================
@@ -627,32 +905,12 @@ with open(
 # RESOURCE PATHS
 # =============================================================================
 
-resource_paths = f"""
-export PIPELINE_ROOT="{ROOT}"
-export PIPELINE_RESOURCES="{RESOURCES}"
-
-export GRCH38_FASTA="{RESOURCES}/genome/GRCh38/GRCh38.primary_assembly.genome.fa"
-
-export GENCODE50_GTF="{RESOURCES}/gencode/release50/gencode.v50.primary_assembly.annotation.gtf.gz"
-
-export GTEX_V11="{RESOURCES}/gtex/v11"
-
-export OPEN_TARGETS_26_09="{RESOURCES}/opentargets/{OPEN_TARGETS_RELEASE}"
-
-export VEP_CACHE_DIR="{RESOURCES}/vep/cache"
-
-export LD_REFERENCE_EUR="{RESOURCES}/1000G/EUR"
-export LD_REFERENCE_AFR="{RESOURCES}/1000G/AFR"
-export LD_REFERENCE_EAS="{RESOURCES}/1000G/EAS"
-export LD_REFERENCE_SAS="{RESOURCES}/1000G/SAS"
-export LD_REFERENCE_AMR="{RESOURCES}/1000G/AMR"
-
-export PANGOLIN_DB="{RESOURCES}/pangolin/gencode.v50.primary_assembly.annotation.db"
-"""
-
+# Same keys as before (PIPELINE_ROOT, GRCH38_FASTA, GENCODE50_GTF, GTEX_V11,
+# OPEN_TARGETS_26_09, VEP_CACHE_DIR, LD_REFERENCE_<ANC>, PANGOLIN_DB) plus the
+# VEP / Pangolin / SpliceAI executables, all taken from gwas2m_resources.
 write_file(
     "resource_paths.env",
-    resource_paths,
+    gwas2m_resources.resource_paths_env_text(ROOT),
 )
 
 
@@ -1011,13 +1269,7 @@ write_file(
 
 genome_script = f"""
 #!/bin/bash
-#SBATCH --job-name=res_genome
-{SBATCH_PARTITION}
-#SBATCH --time=24:00:00
-#SBATCH --mem=24G
-#SBATCH --cpus-per-task=4
-#SBATCH --output={LOGS}/02_genome.%j.out
-#SBATCH --error={LOGS}/02_genome.%j.err
+{sbatch_header("setup_genome", "res_genome", "02_genome")}
 
 set -euo pipefail
 
@@ -1097,14 +1349,7 @@ write_file(
 
 gtex_script = f"""
 #!/bin/bash
-#SBATCH --job-name=res_gtex
-{SBATCH_PARTITION}
-#SBATCH --time=48:00:00
-#SBATCH --mem=16G
-#SBATCH --cpus-per-task=2
-#SBATCH --array=1-6%4
-#SBATCH --output={LOGS}/03_gtex.%A_%a.out
-#SBATCH --error={LOGS}/03_gtex.%A_%a.err
+{sbatch_header("setup_gtex", "res_gtex", "03_gtex", 6)}
 
 set -euo pipefail
 
@@ -1203,14 +1448,7 @@ write_file(
 
 g1000_script = f"""
 #!/bin/bash
-#SBATCH --job-name=res_1000g
-{SBATCH_PARTITION}
-#SBATCH --time=240:00:00
-#SBATCH --mem=12G
-#SBATCH --cpus-per-task=2
-#SBATCH --array=1-23%{DOWNLOAD_MAX_PARALLEL}
-#SBATCH --output={LOGS}/04_1000g.%A_%a.out
-#SBATCH --error={LOGS}/04_1000g.%A_%a.err
+{sbatch_header("setup_1000g_download", "res_1000g", "04_1000g", 23)}
 
 set -euo pipefail
 
@@ -1298,14 +1536,7 @@ write_file(
 
 convert_script = f"""
 #!/bin/bash
-#SBATCH --job-name=res_1000g_all
-{SBATCH_PARTITION}
-#SBATCH --time=120:00:00
-#SBATCH --mem=48G
-#SBATCH --cpus-per-task=4
-#SBATCH --array=1-22%{PGEN_MAX_PARALLEL}
-#SBATCH --output={LOGS}/05_1000g_all.%A_%a.out
-#SBATCH --error={LOGS}/05_1000g_all.%A_%a.err
+{sbatch_header("setup_1000g_all", "res_1000g_all", "05_1000g_all", 22)}
 
 set -euo pipefail
 
@@ -1403,13 +1634,7 @@ write_file(
 
 samples_script = f"""
 #!/bin/bash
-#SBATCH --job-name=res_1000g_samples
-{SBATCH_PARTITION}
-#SBATCH --time=01:00:00
-#SBATCH --mem=4G
-#SBATCH --cpus-per-task=1
-#SBATCH --output={LOGS}/06_samples.%j.out
-#SBATCH --error={LOGS}/06_samples.%j.err
+{sbatch_header("setup_1000g_samples", "res_1000g_samples", "06_samples")}
 
 set -euo pipefail
 
@@ -1491,14 +1716,7 @@ write_file(
 
 population_script = f"""
 #!/bin/bash
-#SBATCH --job-name=res_1000g_pop
-{SBATCH_PARTITION}
-#SBATCH --time=120:00:00
-#SBATCH --mem=32G
-#SBATCH --cpus-per-task=4
-#SBATCH --array=1-110%{POPULATION_MAX_PARALLEL}
-#SBATCH --output={LOGS}/07_1000g_pop.%A_%a.out
-#SBATCH --error={LOGS}/07_1000g_pop.%A_%a.err
+{sbatch_header("setup_1000g_populations", "res_1000g_pop", "07_1000g_pop", 110)}
 
 set -euo pipefail
 
@@ -1599,13 +1817,7 @@ write_file(
 
 vep_script = f"""
 #!/bin/bash
-#SBATCH --job-name=res_vep
-{SBATCH_PARTITION}
-#SBATCH --time=48:00:00
-#SBATCH --mem=24G
-#SBATCH --cpus-per-task=4
-#SBATCH --output={LOGS}/08_vep.%j.out
-#SBATCH --error={LOGS}/08_vep.%j.err
+{sbatch_header("setup_vep", "res_vep", "08_vep")}
 
 set -euo pipefail
 
@@ -1676,13 +1888,7 @@ write_file(
 
 pangolin_db_script = f"""
 #!/bin/bash
-#SBATCH --job-name=res_pangolin_db
-{SBATCH_PARTITION}
-#SBATCH --time=12:00:00
-#SBATCH --mem=32G
-#SBATCH --cpus-per-task=4
-#SBATCH --output={LOGS}/09_pangolin_db.%j.out
-#SBATCH --error={LOGS}/09_pangolin_db.%j.err
+{sbatch_header("setup_pangolin_db", "res_pangolin_db", "09_pangolin_db")}
 
 set -euo pipefail
 
@@ -2294,14 +2500,7 @@ write_file(
 
 opentargets_script = f"""
 #!/bin/bash
-#SBATCH --job-name=res_ot
-{SBATCH_PARTITION}
-#SBATCH --time=72:00:00
-#SBATCH --mem=8G
-#SBATCH --cpus-per-task=2
-#SBATCH --array=1-4%2
-#SBATCH --output={LOGS}/10_opentargets.%A_%a.out
-#SBATCH --error={LOGS}/10_opentargets.%A_%a.err
+{sbatch_header("setup_opentargets", "res_ot", "10_opentargets", 4)}
 
 set -euo pipefail
 
@@ -2387,17 +2586,14 @@ write_file(
 
 verify_job = f"""
 #!/bin/bash
-#SBATCH --job-name=res_verify
-{SBATCH_PARTITION}
-#SBATCH --time=01:00:00
-#SBATCH --mem=8G
-#SBATCH --cpus-per-task=1
-#SBATCH --output={LOGS}/11_verify.%j.out
-#SBATCH --error={LOGS}/11_verify.%j.err
+{sbatch_header("setup_verify", "res_verify", "11_verify")}
 
 set -euo pipefail
 
 cd "{ROOT}"
+
+# Record versions/releases actually present (setup_manifests/resource_versions.tsv)
+"{CORE_ENV}/bin/python" "{ROOT}/Step00_Check_Resources.py" --record-versions
 
 "{CORE_ENV}/bin/python" \
     "{ROOT}/Verify_Setup.py"
@@ -2443,7 +2639,7 @@ JALL=$(sbatch --parsable --dependency=afterok:$J1000 "$ROOT/Setup_05_Prepare_100
 JSAMPLES=$(sbatch --parsable --dependency=afterok:$J1000 "$ROOT/Setup_06_Prepare_1000G_Sample_Lists.sh")
 JPOP=$(sbatch --parsable --dependency=afterok:$JALL:$JSAMPLES "$ROOT/Setup_07_Prepare_1000G_Populations.sh")
 JPANG=$(sbatch --parsable --dependency=afterok:$JGENOME "$ROOT/Setup_09_Build_Pangolin_DB.sh")
-JVERIFY=$(sbatch --parsable --dependency=afterok:$JGENOME:$JGTEX:$J1000:$JVEP:$JALL:$JSAMPLES:$JPOP:$JPANG "$ROOT/Setup_10_Verify.sh")
+JVERIFY=$(sbatch --parsable --dependency=afterok:$JGENOME:$JGTEX:$J1000:$JVEP:$JALL:$JSAMPLES:$JPOP:$JPANG "$ROOT/Setup_11_Verify.sh")
 
 cat > "$STATE" <<EOF
 JGENOME=$JGENOME
@@ -2474,7 +2670,7 @@ echo "Open Targets 26.09    : $JOT"
 echo "Final verification    : $JVERIFY"
 echo
 echo "Monitor with: squeue --me"
-echo "Live status: $ROOT/envs/pipeline/bin/python $ROOT/Verify_Setup.py"
+echo "Live status (read-only): $ROOT/envs/pipeline/bin/python $ROOT/Step00_Check_Resources.py --inspect"
 """
 
 write_file(
@@ -2519,31 +2715,6 @@ write_file(
     activate_script,
     executable=True,
 )
-
-
-# =============================================================================
-# ARGUMENTS
-# =============================================================================
-
-parser = argparse.ArgumentParser(
-    description="Install software, prepare reproducible resources, and verify the GWAS mechanism pipeline."
-)
-
-parser.add_argument("--generate-only", action="store_true",
-                    help="Generate setup files only; do not install or submit anything.")
-parser.add_argument("--install-only", action="store_true",
-                    help="Install/repair software only; do not submit resource jobs.")
-parser.add_argument("--resources-only", action="store_true",
-                    help="Skip software installation and submit resource jobs only.")
-parser.add_argument("--status", action="store_true",
-                    help="Generate files, run Verify_Setup.py, print status, and exit.")
-parser.add_argument("--no-submit", action="store_true",
-                    help="Backward-compatible alias for --install-only.")
-parser.add_argument("--submit", action="store_true", help=argparse.SUPPRESS)
-
-args = parser.parse_args()
-if args.install_only and args.resources_only:
-    parser.error("--install-only and --resources-only cannot be used together")
 
 
 # =============================================================================
@@ -2626,15 +2797,12 @@ for file in generated_files:
 # =============================================================================
 
 if args.generate_only:
+    write_resource_versions()
     banner("GENERATION COMPLETE")
     print("No installation or resource commands were executed.")
+    print("Inspect the current state (read-only) with:")
+    print("  python Step00_Check_Resources.py --inspect")
     sys.exit(0)
-
-if args.status:
-    banner("CURRENT SETUP STATUS")
-    rc = run([sys.executable, str(ROOT / "Verify_Setup.py")],
-             label="Verify software and resources", check=False)
-    sys.exit(rc)
 
 package_manager = find_package_manager()
 if package_manager is None and not args.resources_only:
@@ -2657,13 +2825,27 @@ if not resources_only:
         label="Verify current state", check=False)
 
 if install_only:
+    write_resource_versions()
     banner("SOFTWARE STAGE COMPLETE")
     print("Resource jobs were intentionally not submitted.")
     print("Submit them later with:")
     print("  python Step00_Check_Resources.py --resources-only")
     sys.exit(0)
 
+# Small shared GWAS Catalog tables (studies + ancestries) used by Step01
+# discovery. Fetched here once; skipped when already cached.
+banner("GWAS CATALOG METADATA")
+try:
+    import Step01_Plan_GWAS as _step01
+    _session = _step01.make_session()
+    _cache = ROOT / "reference_metadata" / "gwas_catalog"
+    _step01.download_metadata(_session, _step01.STUDIES_URL, _cache / "gwas_catalog_studies.tsv")
+    _step01.download_metadata(_session, _step01.ANCESTRY_URL, _cache / "gwas_catalog_ancestry.tsv")
+except Exception as exc:  # network may be unavailable here; Step01 can still fetch it
+    print(f"WARNING: GWAS Catalog metadata not fetched now ({type(exc).__name__}: {exc})")
+
 if shutil.which("sbatch") is None:
+    write_resource_versions()
     banner("RESOURCE SCRIPTS READY")
     print("SLURM sbatch is not available, so resource jobs were not submitted.")
     print("The generated Setup_02...Setup_11 scripts are ready for a SLURM system.")
@@ -2672,6 +2854,7 @@ if shutil.which("sbatch") is None:
 banner("STAGE 2/2 - SUBMIT SHARED RESOURCE JOBS")
 run(["bash", str(ROOT / "Setup_Submit_All_Resources.sh")],
     label="Submit resumable resource DAG")
+write_resource_versions()
 
 banner("BOOTSTRAP STARTED SUCCESSFULLY")
 print("Software installation has been verified.")
@@ -2681,6 +2864,6 @@ print("Monitor jobs:")
 print("  squeue --me")
 print()
 print("Check current completion at any time:")
-print("  python Step00_Check_Resources.py --status")
+print("  python Step00_Check_Resources.py --inspect")
 print()
 print("After the final verification job succeeds, shared setup is complete.")

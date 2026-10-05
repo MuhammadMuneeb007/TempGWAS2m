@@ -30,6 +30,9 @@ What this does
 8. Ranks eligible studies by sample size.
 9. Creates a download manifest.
 10. Generates Step02_Download_GWAS_<phenotype>_<ancestry>.sh
+11. Writes study_selection.tsv: every phenotype-matched study with its
+    ancestry / summary-statistics / harmonised-file flags and the reason
+    it was or was not selected (audit only; selection is unchanged).
 
 The generated SLURM script downloads each GWAS independently using
 a SLURM array.
@@ -41,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import html
+import json
 import os
 import re
 import sys
@@ -74,14 +78,15 @@ SUMMARY_ROOT = (
 
 
 # =============================================================================
-# SLURM DEFAULTS
+# SLURM SETTINGS
+#
+# Partition / time / memory / CPUs / throttle for the generated Step02 array
+# come from config/slurm.yaml (stage "download"); CLI flags override them.
 # =============================================================================
 
-DEFAULT_PARTITION = "general"
-DEFAULT_TIME_LIMIT = "24:00:00"
-MAX_TIME_HOURS = 24
-DEFAULT_MEMORY = "8G"
-DEFAULT_CPUS_PER_TASK = 1
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import gwas2m_config  # noqa: E402
 
 
 # =============================================================================
@@ -214,52 +219,19 @@ def ancestry_code(value):
 
 
 def validate_slurm_time(value):
+    """Central walltime check: only a configured slurm.max_walltime applies."""
 
-    value = str(value).strip()
+    try:
 
-    match = re.fullmatch(
-        r"(?:(\d+)-)?(\d{1,2}):(\d{2}):(\d{2})",
-        value
-    )
-
-    if not match:
-
-        raise argparse.ArgumentTypeError(
-            "SLURM time must be HH:MM:SS or D-HH:MM:SS. "
-            "Example: 24:00:00"
+        return gwas2m_config.validate_walltime(
+            str(value).strip()
         )
 
-    days = int(match.group(1) or 0)
-    hours = int(match.group(2))
-    minutes = int(match.group(3))
-    seconds = int(match.group(4))
-
-    if minutes >= 60 or seconds >= 60:
+    except gwas2m_config.SlurmConfigError as error:
 
         raise argparse.ArgumentTypeError(
-            "Invalid SLURM time. Minutes and seconds must be < 60."
-        )
-
-    total_seconds = (
-        days * 86400
-        + hours * 3600
-        + minutes * 60
-        + seconds
-    )
-
-    if total_seconds <= 0:
-
-        raise argparse.ArgumentTypeError(
-            "SLURM time must be greater than zero."
-        )
-
-    if total_seconds > MAX_TIME_HOURS * 3600:
-
-        raise argparse.ArgumentTypeError(
-            f"Maximum allowed walltime is {MAX_TIME_HOURS} hours."
-        )
-
-    return value
+            str(error)
+        ) from error
 
 
 def build_terms(
@@ -981,25 +953,31 @@ def generate_slurm_script(
         exist_ok=True
     )
 
-    array_spec = (
-        f"1-{n_jobs}%{max_parallel}"
+    array_spec = gwas2m_config.array_spec(
+        n_jobs,
+        max_parallel
     )
 
     job_name = (
         f"GWAS_{phenotype_slug}_{ancestry_slug}"
     )[:100]
 
+    # Memory/CPUs from config/slurm.yaml (stage "download"); partition and
+    # time are the already-resolved values passed in (None = config value).
+    sbatch_header = gwas2m_config.sbatch_header_from_args(
+        argparse.Namespace(
+            slurm_stage="download",
+            partition=partition,
+            time=time_limit,
+        ),
+        job_name=job_name,
+        output=f"{logs}/step02_%A_%a.out",
+        error=f"{logs}/step02_%A_%a.err",
+        array=array_spec,
+    )
+
     text = f"""#!/bin/bash
-#SBATCH --job-name={job_name}
-#SBATCH --nodes=1
-#SBATCH --partition={partition}
-#SBATCH --time={time_limit}
-#SBATCH --output={logs}/step02_%A_%a.out
-#SBATCH --error={logs}/step02_%A_%a.err
-#SBATCH --array={array_spec}
-#SBATCH --mem={DEFAULT_MEMORY}
-#SBATCH --cpus-per-task={DEFAULT_CPUS_PER_TASK}
-#SBATCH --ntasks=1
+{sbatch_header}
 
 set -euo pipefail
 
@@ -1084,10 +1062,199 @@ echo "$TARGET"
 
 
 # =============================================================================
+# DIRECT SINGLE-STUDY DOWNLOAD (used by Step01_10_Run.py)
+# =============================================================================
+
+def download_study_file(
+    download_url,
+    target
+):
+    """Download one GWAS file exactly as the generated Step02 array does.
+
+    Same tools, flags, '.part' temporary file and final rename as the bash
+    block in generate_slurm_script(); the implementation is the single
+    runtime downloader in gwas2m_resources.download_file(). Returns
+    "SKIPPED_ALREADY_COMPLETE" when the target already exists and is
+    non-empty, otherwise "COMPLETE".
+    """
+
+    sys.path.insert(
+        0,
+        str(Path(__file__).resolve().parent)
+    )
+
+    import gwas2m_resources
+
+    return gwas2m_resources.download_file(
+        download_url,
+        target
+    )
+
+
+# =============================================================================
+# STUDY SELECTION AUDIT TABLE
+#
+# Records EVERY phenotype-matched study and why it was or was not selected.
+# Bookkeeping only: it never changes which studies are selected.
+# =============================================================================
+
+def new_selection_table(
+    candidates,
+    phenotype,
+    ancestry_name,
+    ancestry_info
+):
+
+    rows = []
+
+    for _, row in candidates.iterrows():
+
+        accession = str(
+            row["STUDY ACCESSION"]
+        )
+
+        info = ancestry_info.get(
+            accession,
+            {}
+        )
+
+        rows.append(
+            {
+                "STUDY_ACCESSION": accession,
+                "REQUESTED_PHENOTYPE": phenotype,
+                "DISEASE_TRAIT": row.get("DISEASE/TRAIT", ""),
+                "MAPPED_TRAIT": row.get("MAPPED_TRAIT", ""),
+                "MATCH_SCORE": int(row["MATCH_SCORE"]),
+                "REQUESTED_ANCESTRY": ancestry_name,
+                "ANCESTRY_CATEGORIES": info.get("ANCESTRY_CATEGORIES", ""),
+                "ANCESTRY_MATCH": bool(info.get("STRICT_MATCH", False)),
+                "INITIAL_SAMPLE_SIZE": row.get("INITIAL SAMPLE SIZE", ""),
+                "SUMMARY_STATS_AVAILABLE": has_full_summary_stats(
+                    row.get("FULL SUMMARY STATISTICS")
+                ),
+                "HARMONISED_FILE_AVAILABLE": "NOT_CHECKED",
+                "DOWNLOAD_URL": "",
+                "ELIGIBLE": False,
+                "EXCLUSION_REASON": "",
+                "RANK": "",
+            }
+        )
+
+    columns = [
+        "STUDY_ACCESSION", "REQUESTED_PHENOTYPE", "DISEASE_TRAIT",
+        "MAPPED_TRAIT", "MATCH_SCORE", "REQUESTED_ANCESTRY",
+        "ANCESTRY_CATEGORIES", "ANCESTRY_MATCH", "INITIAL_SAMPLE_SIZE",
+        "SUMMARY_STATS_AVAILABLE", "HARMONISED_FILE_AVAILABLE",
+        "DOWNLOAD_URL", "ELIGIBLE", "EXCLUSION_REASON", "RANK",
+    ]
+
+    selection = pd.DataFrame(
+        rows,
+        columns=columns
+    )
+
+    selection.index = selection[
+        "STUDY_ACCESSION"
+    ].tolist()
+
+    # Reasons follow the planner's filter order:
+    # full summary statistics -> strict ancestry -> harmonised file.
+    no_sumstats = ~selection[
+        "SUMMARY_STATS_AVAILABLE"
+    ].astype(bool)
+
+    selection.loc[
+        no_sumstats,
+        "EXCLUSION_REASON"
+    ] = "NO_FULL_SUMMARY_STATISTICS"
+
+    no_ancestry = (
+        (selection["EXCLUSION_REASON"] == "")
+        & ~selection["ANCESTRY_MATCH"].astype(bool)
+    )
+
+    selection.loc[
+        no_ancestry
+        & (selection["ANCESTRY_CATEGORIES"] == ""),
+        "EXCLUSION_REASON"
+    ] = "ANCESTRY_NOT_REPORTED"
+
+    selection.loc[
+        no_ancestry
+        & (selection["ANCESTRY_CATEGORIES"] != ""),
+        "EXCLUSION_REASON"
+    ] = "ANCESTRY_MISMATCH"
+
+    return selection
+
+
+def write_study_selection(
+    state
+):
+
+    analysis_dir = state.get(
+        "analysis_dir"
+    )
+
+    if analysis_dir is None:
+        return
+
+    selection = state.get(
+        "selection"
+    )
+
+    if selection is None:
+
+        selection = pd.DataFrame(
+            columns=[
+                "STUDY_ACCESSION",
+                "REQUESTED_PHENOTYPE",
+                "ELIGIBLE",
+                "EXCLUSION_REASON",
+            ]
+        )
+
+    selection = selection.copy()
+
+    # Studies that were never checked for a harmonised file because
+    # --max-studies was reached are explicitly labelled, not dropped.
+    unchecked = (
+        (selection["EXCLUSION_REASON"] == "")
+        & ~selection["ELIGIBLE"].astype(bool)
+    )
+
+    selection.loc[
+        unchecked,
+        "EXCLUSION_REASON"
+    ] = "NOT_CHECKED_MAX_STUDIES_LIMIT"
+
+    selection.to_csv(
+        analysis_dir / "study_selection.tsv",
+        sep="\t",
+        index=False
+    )
+
+    summary = {
+        key: value
+        for key, value in state.items()
+        if key not in {"analysis_dir", "selection"}
+    }
+
+    (analysis_dir / "discovery_summary.json").write_text(
+        json.dumps(
+            summary,
+            indent=2,
+            default=str
+        ),
+        encoding="utf-8"
+    )
+
+
+# =============================================================================
 # ARGUMENTS
 # =============================================================================
 
-def arguments():
+def arguments(argv=None):
 
     parser = argparse.ArgumentParser()
 
@@ -1124,28 +1291,29 @@ def arguments():
     parser.add_argument(
         "--max-parallel",
         type=int,
-        default=4,
+        default=None,
         help=(
-            "Maximum simultaneous SLURM downloads."
+            "Maximum simultaneous SLURM downloads (%%N). "
+            "Default: config/slurm.yaml (stage 'download'); 0 = no throttle."
         )
     )
 
     parser.add_argument(
         "--partition",
-        default=DEFAULT_PARTITION,
+        default=None,
         help=(
-            f"SLURM partition for generated Step 02 jobs. "
-            f"Default: {DEFAULT_PARTITION}"
+            "SLURM partition for generated Step 02 jobs. "
+            "Default: config/slurm.yaml (stage 'download')."
         )
     )
 
     parser.add_argument(
         "--time",
         type=validate_slurm_time,
-        default=DEFAULT_TIME_LIMIT,
+        default=None,
         help=(
             "SLURM walltime for generated Step 02 jobs. "
-            "Maximum 24 hours. Default: 24:00:00"
+            "Default: config/slurm.yaml (stage 'download')."
         )
     )
 
@@ -1154,16 +1322,52 @@ def arguments():
         action="store_true"
     )
 
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+
+    gwas2m_config.apply_stage_defaults(
+        args,
+        "download"
+    )
+
+    return args
 
 
 # =============================================================================
 # MAIN
 # =============================================================================
 
+def plan(args):
+    """Run Step01 planning and always write study_selection.tsv.
+
+    Returns a dict with the manifest/candidate paths and counts.
+    Raises RuntimeError exactly where the planner always has
+    (e.g. no eligible studies); the selection table is still written.
+    """
+
+    state = {}
+
+    try:
+
+        return _plan(
+            args,
+            state
+        )
+
+    finally:
+
+        write_study_selection(
+            state
+        )
+
+
 def main():
 
-    args = arguments()
+    plan(
+        arguments()
+    )
+
+
+def _plan(args, state):
 
     phenotype = args.phenotype.strip()
 
@@ -1179,10 +1383,10 @@ def main():
             "--max-studies must be >= 0."
         )
 
-    if args.max_parallel < 1:
+    if args.max_parallel < 0:
 
         raise RuntimeError(
-            "--max-parallel must be >= 1."
+            "--max-parallel must be >= 0 (0 = no throttle)."
         )
 
     ancestry_name = canonical_ancestry(
@@ -1242,6 +1446,13 @@ def main():
         exist_ok=True
     )
 
+    state["analysis_dir"] = analysis_dir
+    state["REQUESTED_PHENOTYPE"] = phenotype
+    state["REQUESTED_ANCESTRY"] = ancestry_name
+    state["ANCESTRY_CODE"] = ancestry_code_value
+    state["SEARCH_TERMS"] = terms
+    state["MAX_STUDIES"] = args.max_studies
+
     studies_file = (
         cache
         / "gwas_catalog_studies.tsv"
@@ -1275,7 +1486,7 @@ def main():
     )
 
     print(
-        f"Partition : {args.partition}"
+        f"Partition : {args.partition or 'scheduler default'}"
     )
 
     print(
@@ -1328,6 +1539,15 @@ def main():
         low_memory=False
     )
 
+    state["GWAS_CATALOG_STUDIES_URL"] = STUDIES_URL
+    state["GWAS_CATALOG_ANCESTRY_URL"] = ANCESTRY_URL
+    state["N_CATALOG_STUDIES"] = int(len(studies))
+
+    ancestry_info = get_ancestry_information(
+        ancestry,
+        ancestry_name
+    )
+
     # -------------------------------------------------------------------------
     # Phenotype
     # -------------------------------------------------------------------------
@@ -1344,6 +1564,15 @@ def main():
     print(
         f"Phenotype matches: {len(candidates):,}"
     )
+
+    state["selection"] = new_selection_table(
+        candidates,
+        phenotype,
+        ancestry_name,
+        ancestry_info
+    )
+
+    state["N_PHENOTYPE_MATCHED"] = int(len(candidates))
 
     if candidates.empty:
 
@@ -1377,6 +1606,8 @@ def main():
         f"With full summary statistics: {len(candidates):,}"
     )
 
+    state["N_WITH_FULL_SUMMARY_STATISTICS"] = int(len(candidates))
+
     if candidates.empty:
 
         raise RuntimeError(
@@ -1389,11 +1620,6 @@ def main():
 
     banner(
         "ANCESTRY FILTER"
-    )
-
-    ancestry_info = get_ancestry_information(
-        ancestry,
-        ancestry_name
     )
 
     strict_accessions = {
@@ -1420,6 +1646,8 @@ def main():
         f"Strict {ancestry_name} studies: "
         f"{len(candidates):,}"
     )
+
+    state["N_FULL_SUMMARY_STATISTICS_AND_ANCESTRY_MATCHED"] = int(len(candidates))
 
     if candidates.empty:
 
@@ -1509,6 +1737,13 @@ def main():
         ]
     )
 
+    for rank, accession in enumerate(
+        candidates["STUDY ACCESSION"].astype(str),
+        start=1
+    ):
+
+        state["selection"].at[accession, "RANK"] = rank
+
     candidate_file = (
         analysis_dir
         / "candidate_studies.tsv"
@@ -1555,6 +1790,9 @@ def main():
                 "no harmonised file"
             )
 
+            state["selection"].at[accession, "HARMONISED_FILE_AVAILABLE"] = False
+            state["selection"].at[accession, "EXCLUSION_REASON"] = "NO_HARMONISED_FILE"
+
             continue
 
         print(
@@ -1562,6 +1800,10 @@ def main():
                 "FILENAME"
             ]
         )
+
+        state["selection"].at[accession, "HARMONISED_FILE_AVAILABLE"] = True
+        state["selection"].at[accession, "DOWNLOAD_URL"] = result["URL"]
+        state["selection"].at[accession, "ELIGIBLE"] = True
 
         eligible.append(
             {
@@ -1706,6 +1948,10 @@ def main():
         index=False
     )
 
+    state["N_ELIGIBLE"] = int(len(manifest))
+    state["CANDIDATE_FILE"] = str(candidate_file)
+    state["DOWNLOAD_MANIFEST"] = str(manifest_file)
+
     # -------------------------------------------------------------------------
     # Generate Step02
     # -------------------------------------------------------------------------
@@ -1730,10 +1976,7 @@ def main():
 
         n_jobs=len(manifest),
 
-        max_parallel=max(
-            1,
-            args.max_parallel
-        ),
+        max_parallel=args.max_parallel,
 
         partition=args.partition,
 
@@ -1761,7 +2004,7 @@ def main():
     )
 
     print(
-        f"SLURM partition     : {args.partition}"
+        f"SLURM partition     : {args.partition or 'scheduler default'}"
     )
 
     print(
@@ -1819,6 +2062,19 @@ def main():
     )
 
     print()
+
+    return {
+        "phenotype": phenotype,
+        "phenotype_slug": phenotype_slug,
+        "ancestry_label": ancestry_name,
+        "ancestry_code": ancestry_code_value,
+        "ancestry_slug": ancestry_slug,
+        "analysis_dir": analysis_dir,
+        "download_dir": download_dir,
+        "candidate_file": candidate_file,
+        "manifest_file": manifest_file,
+        "n_eligible": len(manifest),
+    }
 
 
 if __name__ == "__main__":

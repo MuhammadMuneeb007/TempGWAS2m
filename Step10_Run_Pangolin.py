@@ -59,17 +59,18 @@ import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import gwas2m_config  # noqa: E402  (SLURM settings: config/slurm.yaml)
+
 import numpy as np
 import pandas as pd
 
 
 STEP10_VERSION = "1.0.0"
 
-DEFAULT_PARTITION = "general"
-DEFAULT_TIME = "24:00:00"
-DEFAULT_MEMORY = "64G"
+# SLURM partition/time/memory/CPUs/throttle come from config/slurm.yaml
+# (stage "pangolin"); command-line flags still override them.
 DEFAULT_CPUS = 4
-DEFAULT_MAX_PARALLEL = 2
 
 DEFAULT_DISTANCE = 500
 DEFAULT_MASK = "False"
@@ -139,32 +140,10 @@ def write_json(path: Path, payload: dict) -> None:
 
 
 def read_resource_env(root: Path) -> dict[str, str]:
-    path = root / "resource_paths.env"
-    values: dict[str, str] = {}
-
-    if not path.exists():
-        return values
-
-    for line in path.read_text(
-        encoding="utf-8",
-        errors="replace",
-    ).splitlines():
-
-        line = line.strip()
-
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip().strip("'").strip('"')
-
-        if key.startswith("export "):
-            key = key[7:].strip()
-
-        values[key] = value
-
-    return values
+    """resource_paths.env written by Step00 (shared parser in gwas2m_resources)."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import gwas2m_resources
+    return gwas2m_resources.load_resource_paths(root)
 
 
 def as_bool(series: pd.Series) -> pd.Series:
@@ -210,25 +189,9 @@ def parse_pos_score(value):
     return pos, to_float(score)
 
 
-def validate_walltime(value: str) -> None:
-    text = value.strip()
-    days = 0
-
-    if "-" in text:
-        d, text = text.split("-", 1)
-        days = int(d)
-
-    parts = text.split(":")
-
-    if len(parts) != 3:
-        raise ValueError("--time must use HH:MM:SS or D-HH:MM:SS")
-
-    h, m, s = map(int, parts)
-
-    seconds = days * 86400 + h * 3600 + m * 60 + s
-
-    if seconds <= 0 or seconds > 86400:
-        raise ValueError("Requested walltime must be >0 and <=24 hours.")
+def validate_walltime(value: str) -> str:
+    """Central check (gwas2m_config): only a configured max_walltime applies."""
+    return gwas2m_config.validate_walltime(value)
 
 
 def run_command(
@@ -300,7 +263,7 @@ def run_command(
 # CLI
 # =============================================================================
 
-def arguments():
+def arguments(argv=None):
     parser = argparse.ArgumentParser(
         description=(
             "Run Pangolin for completed Step09 studies and integrate "
@@ -343,15 +306,15 @@ def arguments():
         ),
     )
 
-    parser.add_argument("--partition", default=DEFAULT_PARTITION)
-    parser.add_argument("--time", default=DEFAULT_TIME)
-    parser.add_argument("--memory", default=DEFAULT_MEMORY)
-    parser.add_argument("--cpus", type=int, default=DEFAULT_CPUS)
+    parser.add_argument("--partition", default=None)
+    parser.add_argument("--time", default=None)
+    parser.add_argument("--memory", default=None)
+    parser.add_argument("--cpus", type=int, default=None)
 
     parser.add_argument(
         "--max-parallel",
         type=int,
-        default=DEFAULT_MAX_PARALLEL,
+        default=None,
     )
 
     parser.add_argument(
@@ -378,7 +341,9 @@ def arguments():
         help="Re-run even when a completed Step10 output exists.",
     )
 
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    gwas2m_config.apply_stage_defaults(args, "pangolin")
+    return args
 
 
 def validate_arguments(args) -> None:
@@ -394,8 +359,8 @@ def validate_arguments(args) -> None:
     if args.cpus < 1:
         raise ValueError("--cpus must be >=1.")
 
-    if args.max_parallel < 1:
-        raise ValueError("--max-parallel must be >=1.")
+    if args.max_parallel < 0:
+        raise ValueError("--max-parallel must be >= 0 (0 = no throttle)")
 
     validate_walltime(args.time)
 
@@ -490,6 +455,115 @@ def resolve_resources(root: Path, args) -> dict[str, Path]:
 
 
 # =============================================================================
+# ONE PANGOLIN MANIFEST ROW (shared by planner_mode and Step01_10_Run.py)
+# =============================================================================
+
+def build_pangolin_row(
+    args,
+    task_id: int,
+    accession: str,
+    step09_root: Path,
+    out_root: Path,
+    phenotype: str,
+    ancestry_code: str,
+    ancestry_label: str,
+    resources: dict[str, Path],
+) -> tuple[dict | None, dict | None]:
+    """Return (manifest_row, None) or (None, exclusion_record)."""
+
+    study_dir = step09_root / accession
+
+    step09_summary_file = (
+        study_dir
+        / "spliceai_summary.json"
+    )
+
+    step09_summary = safe_read_json(
+        step09_summary_file
+    )
+
+    variant_file = (
+        study_dir
+        / f"{accession}_SpliceAI_variant_summary.tsv"
+    )
+
+    normalized_vcf = (
+        study_dir
+        / "input"
+        / f"{accession}_SpliceAI_input.normalized.vcf"
+    )
+
+    reason = ""
+
+    if not step09_summary:
+        reason = "Step09 spliceai_summary.json missing/unreadable"
+
+    elif (
+        str(
+            step09_summary.get(
+                "STATUS",
+                "",
+            )
+        ).upper()
+        !=
+        "COMPLETE"
+    ):
+        reason = (
+            "Step09 status is "
+            f"{step09_summary.get('STATUS', 'UNKNOWN')}"
+        )
+
+    elif (
+        not variant_file.exists()
+        or variant_file.stat().st_size == 0
+    ):
+        reason = "Step09 variant summary missing/empty"
+
+    elif (
+        not normalized_vcf.exists()
+        or normalized_vcf.stat().st_size == 0
+    ):
+        reason = "Step09 normalized VCF missing/empty"
+
+    if reason:
+        return None, {
+            "STUDY_ACCESSION": accession,
+            "STEP09_STATUS": step09_summary.get(
+                "STATUS",
+                "",
+            ),
+            "REASON": reason,
+        }
+
+    return {
+        "PANGOLIN_TASK_ID": task_id,
+        "STUDY_ACCESSION": accession,
+        "PHENOTYPE": phenotype,
+        "ANCESTRY_CODE": ancestry_code,
+        "ANCESTRY_LABEL": ancestry_label,
+        "STEP09_VARIANT_FILE": str(
+            variant_file.resolve()
+        ),
+        "STEP09_NORMALIZED_VCF": str(
+            normalized_vcf.resolve()
+        ),
+        "STEP09_SUMMARY_FILE": str(
+            step09_summary_file.resolve()
+        ),
+        "OUTPUT_DIR": str(
+            (out_root / accession).resolve()
+        ),
+        "PANGOLIN": str(resources["PANGOLIN"]),
+        "PANGOLIN_DB": str(resources["PANGOLIN_DB"]),
+        "GRCH38_FASTA": str(resources["FASTA"]),
+        "DISTANCE": args.distance,
+        "MASK": args.mask,
+        "FORCE": bool(args.force),
+        "STEP10_VERSION": STEP10_VERSION,
+    }, None
+
+
+# =============================================================================
 # PLANNER
 # =============================================================================
 
@@ -546,99 +620,23 @@ def planner_mode(args) -> None:
 
         accession = study_dir.name
 
-        step09_summary_file = (
-            study_dir
-            / "spliceai_summary.json"
+        row, exclusion = build_pangolin_row(
+            args,
+            task_id=len(rows) + 1,
+            accession=accession,
+            step09_root=step09_root,
+            out_root=out_root,
+            phenotype=phenotype,
+            ancestry_code=ancestry_code,
+            ancestry_label=ancestry_label,
+            resources=resources,
         )
 
-        step09_summary = safe_read_json(
-            step09_summary_file
-        )
-
-        variant_file = (
-            study_dir
-            / f"{accession}_SpliceAI_variant_summary.tsv"
-        )
-
-        normalized_vcf = (
-            study_dir
-            / "input"
-            / f"{accession}_SpliceAI_input.normalized.vcf"
-        )
-
-        reason = ""
-
-        if not step09_summary:
-            reason = "Step09 spliceai_summary.json missing/unreadable"
-
-        elif (
-            str(
-                step09_summary.get(
-                    "STATUS",
-                    "",
-                )
-            ).upper()
-            !=
-            "COMPLETE"
-        ):
-            reason = (
-                "Step09 status is "
-                f"{step09_summary.get('STATUS', 'UNKNOWN')}"
-            )
-
-        elif (
-            not variant_file.exists()
-            or variant_file.stat().st_size == 0
-        ):
-            reason = "Step09 variant summary missing/empty"
-
-        elif (
-            not normalized_vcf.exists()
-            or normalized_vcf.stat().st_size == 0
-        ):
-            reason = "Step09 normalized VCF missing/empty"
-
-        if reason:
-            excluded.append(
-                {
-                    "STUDY_ACCESSION": accession,
-                    "STEP09_STATUS": step09_summary.get(
-                        "STATUS",
-                        "",
-                    ),
-                    "REASON": reason,
-                }
-            )
+        if exclusion is not None:
+            excluded.append(exclusion)
             continue
 
-        rows.append(
-            {
-                "PANGOLIN_TASK_ID": len(rows) + 1,
-                "STUDY_ACCESSION": accession,
-                "PHENOTYPE": phenotype,
-                "ANCESTRY_CODE": ancestry_code,
-                "ANCESTRY_LABEL": ancestry_label,
-                "STEP09_VARIANT_FILE": str(
-                    variant_file.resolve()
-                ),
-                "STEP09_NORMALIZED_VCF": str(
-                    normalized_vcf.resolve()
-                ),
-                "STEP09_SUMMARY_FILE": str(
-                    step09_summary_file.resolve()
-                ),
-                "OUTPUT_DIR": str(
-                    (out_root / accession).resolve()
-                ),
-                "PANGOLIN": str(resources["PANGOLIN"]),
-                "PANGOLIN_DB": str(resources["PANGOLIN_DB"]),
-                "GRCH38_FASTA": str(resources["FASTA"]),
-                "DISTANCE": args.distance,
-                "MASK": args.mask,
-                "FORCE": bool(args.force),
-                "STEP10_VERSION": STEP10_VERSION,
-            }
-        )
+        rows.append(row)
 
     excluded_file = (
         out_root
@@ -699,7 +697,7 @@ def planner_mode(args) -> None:
         )
     )
 
-    array_spec = f"1-{len(manifest)}"
+    array_spec = gwas2m_config.array_spec(len(manifest), args.max_parallel)
 
     job_name = (
         f"Pangolin_"
@@ -707,17 +705,17 @@ def planner_mode(args) -> None:
         f"{ancestry_code.lower()}"
     )[:100]
 
+    sbatch_header = gwas2m_config.sbatch_header_from_args(
+        args,
+        job_name=job_name,
+        output=f"{log_root}/pangolin.%A_%a.out",
+        error=f"{log_root}/pangolin.%A_%a.err",
+        array=array_spec,
+    )
+
+
     bash_text = f'''#!/bin/bash
-#SBATCH --job-name={job_name}
-#SBATCH --nodes=1
-#SBATCH --partition={args.partition}
-#SBATCH --time={args.time}
-#SBATCH --output={log_root}/pangolin.%A_%a.out
-#SBATCH --error={log_root}/pangolin.%A_%a.err
-#SBATCH --array={array_spec}
-#SBATCH --mem={args.memory}
-#SBATCH --cpus-per-task={args.cpus}
-#SBATCH --ntasks=1
+{sbatch_header}
 
 set -euo pipefail
 

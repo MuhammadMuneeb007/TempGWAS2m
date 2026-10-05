@@ -25,9 +25,9 @@ the script automatically:
 4. Reports GWAS files that are still missing/downloading.
 5. Continues with the available GWAS files.
 6. Creates a Step 03 QC manifest with ancestry code + label.
-7. Generates a SLURM array bash file on the general partition.
+7. Generates a SLURM array bash file (settings from config/slurm.yaml, stage qc).
 8. Forces workers to use envs/pipeline/bin/python.
-9. Rejects requested walltimes above 24 hours.
+9. Rejects walltimes above slurm.max_walltime when one is configured.
 
 Example generated file:
 
@@ -104,6 +104,9 @@ import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import gwas2m_config  # noqa: E402  (SLURM settings: config/slurm.yaml)
+
 import pandas as pd
 
 
@@ -111,12 +114,8 @@ import pandas as pd
 # CONFIGURATION
 # =============================================================================
 
-PARTITION = "general"
-
-TIME_LIMIT = "24:00:00"
-
-MEMORY = "100G"
-
+# SLURM partition/time/memory/CPUs come from config/slurm.yaml (stage "qc");
+# CPUS_PER_TASK is only the GWASLab thread fallback outside SLURM.
 CPUS_PER_TASK = 4
 
 P_THRESHOLD = 5e-8
@@ -213,73 +212,15 @@ def canonical_ancestry(value):
 # =============================================================================
 
 def validate_slurm_time(value):
-
-    text = str(value).strip()
+    """Central walltime check: only a configured slurm.max_walltime applies."""
 
     try:
-
-        if "-" in text:
-
-            day_text, clock = text.split("-", 1)
-
-            days = int(day_text)
-
-        else:
-
-            days = 0
-            clock = text
-
-        parts = clock.split(":")
-
-        if len(parts) != 3:
-
-            raise ValueError
-
-        hours, minutes, seconds = (
-            int(part)
-            for part in parts
-        )
-
-        if (
-            days < 0
-            or hours < 0
-            or minutes < 0
-            or minutes > 59
-            or seconds < 0
-            or seconds > 59
-        ):
-
-            raise ValueError
-
-        total_seconds = (
-            days * 86400
-            + hours * 3600
-            + minutes * 60
-            + seconds
-        )
-
-    except ValueError as error:
-
-        raise argparse.ArgumentTypeError(
-            "SLURM time must be HH:MM:SS or D-HH:MM:SS."
-        ) from error
-
-    if total_seconds <= 0:
-
-        raise argparse.ArgumentTypeError(
-            "SLURM time must be greater than zero."
-        )
-
-    if total_seconds > 86400:
-
-        raise argparse.ArgumentTypeError(
-            "Maximum allowed walltime is 24 hours."
-        )
-
-    return text
+        return gwas2m_config.validate_walltime(str(value).strip())
+    except gwas2m_config.SlurmConfigError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
 
 
-def arguments():
+def arguments(argv=None):
 
     parser = argparse.ArgumentParser(
         description=(
@@ -304,19 +245,19 @@ def arguments():
 
     parser.add_argument(
         "--partition",
-        default=PARTITION,
+        default=None,
         help=(
-            f"SLURM partition. Default: {PARTITION}"
+            "SLURM partition. Default: config/slurm.yaml (stage qc)."
         ),
     )
 
     parser.add_argument(
         "--time",
-        default=TIME_LIMIT,
+        default=None,
         type=validate_slurm_time,
         help=(
             "Per-task SLURM walltime. Maximum 24 hours. "
-            f"Default: {TIME_LIMIT}"
+            "Default: config/slurm.yaml (stage qc)."
         ),
     )
 
@@ -330,7 +271,55 @@ def arguments():
         ),
     )
 
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    gwas2m_config.apply_stage_defaults(args, "qc")
+    return args
+
+
+# =============================================================================
+# ONE QC MANIFEST ROW (shared by planner_mode and Step01_10_Run.py)
+# =============================================================================
+
+def build_qc_row(
+    task_id,
+    accession,
+    input_file,
+    output_directory,
+    phenotype,
+    ancestry_code,
+    ancestry_label,
+):
+
+    return {
+        "QC_TASK_ID":
+            task_id,
+
+        "STUDY_ACCESSION":
+            accession,
+
+        "INPUT_FILE":
+            str(input_file),
+
+        "OUTPUT_DIR":
+            str(
+                output_directory.resolve()
+            ),
+
+        "PHENOTYPE":
+            phenotype,
+
+        "ANCESTRY":
+            ancestry_label,
+
+        "ANCESTRY_CODE":
+            ancestry_code,
+
+        "ANCESTRY_LABEL":
+            ancestry_label,
+
+        "INPUT_SIZE_BYTES":
+            input_file.stat().st_size,
+    }
 
 
 # =============================================================================
@@ -934,7 +923,7 @@ def planner_mode(args):
     )
 
     print(
-        f"Partition : {args.partition}"
+        f"Partition : {args.partition or 'scheduler default'}"
     )
 
     print(
@@ -1071,36 +1060,15 @@ def planner_mode(args):
         )
 
         qc_rows.append(
-            {
-                "QC_TASK_ID":
-                    len(qc_rows) + 1,
-
-                "STUDY_ACCESSION":
-                    accession,
-
-                "INPUT_FILE":
-                    str(input_file),
-
-                "OUTPUT_DIR":
-                    str(
-                        output_directory.resolve()
-                    ),
-
-                "PHENOTYPE":
-                    phenotype,
-
-                "ANCESTRY":
-                    ancestry_label,
-
-                "ANCESTRY_CODE":
-                    ancestry_code,
-
-                "ANCESTRY_LABEL":
-                    ancestry_label,
-
-                "INPUT_SIZE_BYTES":
-                    input_file.stat().st_size,
-            }
+            build_qc_row(
+                task_id=len(qc_rows) + 1,
+                accession=accession,
+                input_file=input_file,
+                output_directory=output_directory,
+                phenotype=phenotype,
+                ancestry_code=ancestry_code,
+                ancestry_label=ancestry_label,
+            )
         )
 
     # -------------------------------------------------------------------------
@@ -1231,17 +1199,18 @@ def planner_mode(args):
     #
     # #SBATCH --array=1-12%4
 
+    qc_resources = args.slurm_resources
+
+    sbatch_header = gwas2m_config.sbatch_header_from_args(
+        args,
+        job_name=job_name,
+        output=f"{log_root}/qc.%A_%a.out",
+        error=f"{log_root}/qc.%A_%a.err",
+        array=gwas2m_config.array_spec(number_of_jobs, qc_resources["max_parallel"]),
+    )
+
     bash_text = f"""#!/bin/bash
-#SBATCH --job-name={job_name}
-#SBATCH --nodes=1
-#SBATCH --partition={args.partition}
-#SBATCH --time={args.time}
-#SBATCH --output={log_root}/qc.%A_%a.out
-#SBATCH --error={log_root}/qc.%A_%a.err
-#SBATCH --array=1-{number_of_jobs}
-#SBATCH --mem={MEMORY}
-#SBATCH --cpus-per-task={CPUS_PER_TASK}
-#SBATCH --ntasks=1
+{sbatch_header}
 
 set -euo pipefail
 
@@ -1257,7 +1226,7 @@ echo "Array task ID : $SLURM_ARRAY_TASK_ID"
 echo "Phenotype     : {phenotype}"
 echo "Ancestry      : {ancestry_label}"
 echo "Ancestry code : {ancestry_code}"
-echo "Partition     : {args.partition}"
+echo "Partition     : {args.partition or 'scheduler default'}"
 echo "Walltime      : {args.time}"
 echo "Hostname      : $(hostname)"
 echo "Python        : {python_path}"
@@ -1303,7 +1272,7 @@ echo "=============================================================="
     )
 
     print(
-        f"Partition         : {args.partition}"
+        f"Partition         : {args.partition or 'scheduler default'}"
     )
 
     print(
@@ -1335,16 +1304,16 @@ echo "=============================================================="
     )
 
     print(
-        "Concurrency cap   : NONE"
+        f"Concurrency cap   : {qc_resources['max_parallel'] or 'NONE'}"
     )
 
     print(
-        f"Memory per task   : {MEMORY}"
+        f"Memory per task   : {qc_resources['memory']}"
     )
 
     print(
         f"CPUs per task     : "
-        f"{CPUS_PER_TASK}"
+        f"{qc_resources['cpus']}"
     )
 
     print()

@@ -66,8 +66,8 @@ NOTES
       p2 = 1e-2
       r2 = 0.1
       kb = 1000
-- SLURM partition defaults to 'general'.
-- Requested walltime may not exceed 24 hours.
+- SLURM settings come from config/slurm.yaml (stage clumping); CLI flags override.
+- Walltime is limited only by slurm.max_walltime when configured.
 """
 
 from __future__ import annotations
@@ -85,6 +85,9 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import gwas2m_config  # noqa: E402  (SLURM settings: config/slurm.yaml)
+
 import pandas as pd
 
 
@@ -92,11 +95,9 @@ import pandas as pd
 # DEFAULTS
 # =============================================================================
 
-DEFAULT_PARTITION = "general"
-DEFAULT_TIME = "24:00:00"
-DEFAULT_MEMORY = "32G"
+# SLURM partition/time/memory/CPUs/throttle come from config/slurm.yaml
+# (stage "clumping"); command-line flags still override them.
 DEFAULT_CPUS = 4
-DEFAULT_MAX_PARALLEL = 4
 DEFAULT_P1 = 5e-8
 DEFAULT_P2 = 1e-2
 DEFAULT_R2 = 0.1
@@ -174,12 +175,8 @@ def parse_walltime(value: str) -> int:
 
 
 def validate_walltime(value: str) -> str:
-    seconds = parse_walltime(value)
-    if seconds <= 0:
-        raise ValueError("Walltime must be greater than zero.")
-    if seconds > 24 * 3600:
-        raise ValueError("Maximum allowed walltime is 24 hours.")
-    return value
+    """Central check (gwas2m_config): only a configured max_walltime applies."""
+    return gwas2m_config.validate_walltime(value)
 
 
 def find_column(columns, candidates):
@@ -212,7 +209,7 @@ def clean_allele(value) -> str | None:
 # =============================================================================
 
 
-def arguments():
+def arguments(argv=None):
     parser = argparse.ArgumentParser(
         description="Generate and run ancestry-matched LD clumping for QC'd GWAS files."
     )
@@ -223,11 +220,11 @@ def arguments():
         required=True,
         help="EUR, AFR, EAS, SAS, AMR or corresponding full ancestry label.",
     )
-    parser.add_argument("--partition", default=DEFAULT_PARTITION)
-    parser.add_argument("--time", default=DEFAULT_TIME)
-    parser.add_argument("--memory", default=DEFAULT_MEMORY)
-    parser.add_argument("--cpus", type=int, default=DEFAULT_CPUS)
-    parser.add_argument("--max-parallel", type=int, default=DEFAULT_MAX_PARALLEL)
+    parser.add_argument("--partition", default=None)
+    parser.add_argument("--time", default=None)
+    parser.add_argument("--memory", default=None)
+    parser.add_argument("--cpus", type=int, default=None)
+    parser.add_argument("--max-parallel", type=int, default=None)
     parser.add_argument(
         "--index",
         type=int,
@@ -249,7 +246,9 @@ def arguments():
         help="Allow clumping to proceed when some expected Step 03 QC files are still missing.",
     )
 
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    gwas2m_config.apply_stage_defaults(args, "clumping")
+    return args
 
 
 def validate_arguments(args) -> None:
@@ -260,8 +259,8 @@ def validate_arguments(args) -> None:
 
     if args.cpus < 1:
         raise ValueError("--cpus must be >= 1")
-    if args.max_parallel < 1:
-        raise ValueError("--max-parallel must be >= 1")
+    if args.max_parallel < 0:
+        raise ValueError("--max-parallel must be >= 0 (0 = no throttle)")
     if args.index is not None and args.index < 1:
         raise ValueError("--index must be >= 1")
     if args.chunk_size < 10_000:
@@ -310,6 +309,67 @@ def validate_reference(root: Path, ancestry_code: str) -> None:
         raise RuntimeError(
             f"1000G {ancestry_code} reference is incomplete. Missing:\n{preview}"
         )
+
+
+# =============================================================================
+# ONE CLUMPING MANIFEST ROW (shared by planner_mode and Step01_10_Run.py)
+# =============================================================================
+
+
+def build_clump_row(
+    args,
+    task_id: int,
+    accession: str,
+    qc_file: Path,
+    output_root: Path,
+    phenotype: str,
+    ancestry_code: str,
+    ancestry_label: str,
+) -> tuple[dict | None, dict | None]:
+    """Return (manifest_row, None) or (None, exclusion_record)."""
+    summary_file = qc_file.parent / f"{accession}_QC_summary.tsv"
+
+    clumping_ready = True
+    qc_status = "UNKNOWN"
+    reason = ""
+
+    if summary_file.exists() and summary_file.stat().st_size > 0:
+        try:
+            summary_df = pd.read_csv(summary_file, sep="\t", dtype=str)
+            if not summary_df.empty:
+                summary_row = summary_df.iloc[0]
+                qc_status = str(summary_row.get("QC_STATUS", "UNKNOWN"))
+                ready_text = str(summary_row.get("CLUMPING_READY", "True")).strip().lower()
+                clumping_ready = ready_text in {"true", "1", "yes", "y"}
+        except Exception as exc:
+            reason = f"Could not read QC summary: {exc}"
+
+    if not clumping_ready:
+        return None, {
+            "STUDY_ACCESSION": accession,
+            "QC_FILE": str(qc_file.resolve()),
+            "QC_STATUS": qc_status,
+            "REASON": reason or "Step 03 marked CLUMPING_READY=False",
+        }
+
+    study_output = output_root / accession
+    return {
+        "CLUMP_TASK_ID": task_id,
+        "STUDY_ACCESSION": accession,
+        "QC_FILE": str(qc_file.resolve()),
+        "QC_SUMMARY_FILE": str(summary_file.resolve()) if summary_file.exists() else "",
+        "QC_STATUS": qc_status,
+        "OUTPUT_DIR": str(study_output.resolve()),
+        "PHENOTYPE": phenotype,
+        "ANCESTRY": ancestry_label,
+        "ANCESTRY_CODE": ancestry_code,
+        "ANCESTRY_LABEL": ancestry_label,
+        "P1": args.p1,
+        "P2": args.p2,
+        "R2": args.r2,
+        "KB": args.kb,
+        "CHUNK_SIZE": args.chunk_size,
+    }, None
 
 
 # =============================================================================
@@ -417,55 +477,23 @@ def planner_mode(args) -> None:
 
     for qc_file in qc_files:
         accession = qc_file.parent.name
-        summary_file = qc_file.parent / f"{accession}_QC_summary.tsv"
 
-        clumping_ready = True
-        qc_status = "UNKNOWN"
-        reason = ""
+        row, exclusion = build_clump_row(
+            args,
+            task_id=len(rows) + 1,
+            accession=accession,
+            qc_file=qc_file,
+            output_root=output_root,
+            phenotype=phenotype,
+            ancestry_code=ancestry_code,
+            ancestry_label=ancestry_label,
+        )
 
-        if summary_file.exists() and summary_file.stat().st_size > 0:
-            try:
-                summary_df = pd.read_csv(summary_file, sep="\t", dtype=str)
-                if not summary_df.empty:
-                    summary_row = summary_df.iloc[0]
-                    qc_status = str(summary_row.get("QC_STATUS", "UNKNOWN"))
-                    ready_text = str(summary_row.get("CLUMPING_READY", "True")).strip().lower()
-                    clumping_ready = ready_text in {"true", "1", "yes", "y"}
-            except Exception as exc:
-                reason = f"Could not read QC summary: {exc}"
-
-        if not clumping_ready:
-            exclusions.append(
-                {
-                    "STUDY_ACCESSION": accession,
-                    "QC_FILE": str(qc_file.resolve()),
-                    "QC_STATUS": qc_status,
-                    "REASON": reason or "Step 03 marked CLUMPING_READY=False",
-                }
-            )
+        if exclusion is not None:
+            exclusions.append(exclusion)
             continue
 
-        task_id = len(rows) + 1
-        study_output = output_root / accession
-        rows.append(
-            {
-                "CLUMP_TASK_ID": task_id,
-                "STUDY_ACCESSION": accession,
-                "QC_FILE": str(qc_file.resolve()),
-                "QC_SUMMARY_FILE": str(summary_file.resolve()) if summary_file.exists() else "",
-                "QC_STATUS": qc_status,
-                "OUTPUT_DIR": str(study_output.resolve()),
-                "PHENOTYPE": phenotype,
-                "ANCESTRY": ancestry_label,
-                "ANCESTRY_CODE": ancestry_code,
-                "ANCESTRY_LABEL": ancestry_label,
-                "P1": args.p1,
-                "P2": args.p2,
-                "R2": args.r2,
-                "KB": args.kb,
-                "CHUNK_SIZE": args.chunk_size,
-            }
-        )
+        rows.append(row)
 
     if exclusions:
         pd.DataFrame(exclusions).to_csv(
@@ -488,19 +516,19 @@ def planner_mode(args) -> None:
     )
 
     job_name = f"CLUMP_{phenotype_slug}_{ancestry_code.lower()}"[:100]
-    array_spec = f"1-{len(manifest)}%{args.max_parallel}"
+    array_spec = gwas2m_config.array_spec(len(manifest), args.max_parallel)
+
+    sbatch_header = gwas2m_config.sbatch_header_from_args(
+        args,
+        job_name=job_name,
+        output=f"{log_root}/clump.%A_%a.out",
+        error=f"{log_root}/clump.%A_%a.err",
+        array=array_spec,
+    )
+
 
     bash_text = f'''#!/bin/bash
-#SBATCH --job-name={job_name}
-#SBATCH --nodes=1
-#SBATCH --partition={args.partition}
-#SBATCH --time={args.time}
-#SBATCH --output={log_root}/clump.%A_%a.out
-#SBATCH --error={log_root}/clump.%A_%a.err
-#SBATCH --array={array_spec}
-#SBATCH --mem={args.memory}
-#SBATCH --cpus-per-task={args.cpus}
-#SBATCH --ntasks=1
+{sbatch_header}
 
 set -euo pipefail
 
@@ -538,7 +566,7 @@ printf '%s\n' "=============================================================="
     print(f"Excluded           : {len(exclusions)}")
     print(f"Missing QC outputs : {len(missing_qc_accessions)}")
     print(f"Reference          : resources/1000G/{ancestry_code}/")
-    print(f"Partition          : {args.partition}")
+    print(f"Partition          : {args.partition or 'scheduler default'}")
     print(f"Walltime           : {args.time}")
     print(f"Memory/task        : {args.memory}")
     print(f"CPUs/task          : {args.cpus}")
@@ -906,6 +934,9 @@ def worker_mode() -> None:
     kb = int(float(row["KB"]))
     chunk_size = int(float(row["CHUNK_SIZE"]))
     threads = int(os.environ.get("SLURM_CPUS_PER_TASK", DEFAULT_CPUS))
+    # Optional column (Step01_10_Run.py sets it when Step 03 was re-run);
+    # planner manifests do not contain it, so default behaviour is unchanged.
+    force = str(row.get("FORCE", "False")).strip().lower() in {"true", "1", "yes", "y"}
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -917,7 +948,8 @@ def worker_mode() -> None:
 
     # Resume only when all key deliverables are present.
     if (
-        lead_output.exists()
+        not force
+        and lead_output.exists()
         and summary_tsv.exists()
         and summary_json.exists()
         and mapped_output.exists()

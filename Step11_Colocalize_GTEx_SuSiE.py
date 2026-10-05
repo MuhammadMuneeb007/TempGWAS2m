@@ -194,6 +194,9 @@ import tarfile
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import gwas2m_config  # noqa: E402  (SLURM settings: config/slurm.yaml; scheduling only)
 from typing import Any, Iterable
 
 import numpy as np
@@ -202,11 +205,8 @@ import pandas as pd
 
 STEP11_VERSION = "4.3.0-local-fast-no-lbf"
 
-DEFAULT_PARTITION = "general"
-DEFAULT_TIME = "24:00:00"
-DEFAULT_MEMORY = "64G"
+# SLURM partition/time/memory/CPUs/throttle: config/slurm.yaml (stage "coloc_core").
 DEFAULT_CPUS = 4
-DEFAULT_MAX_PARALLEL = 0
 DEFAULT_REMOTE_DELAY = 0.0
 DEFAULT_LD_MAF = 0.01
 DEFAULT_LD_MISMATCH_S = 0.10
@@ -510,8 +510,12 @@ def validate_walltime(value: str) -> str:
         raise argparse.ArgumentTypeError("Walltime must be HH:MM:SS or D-HH:MM:SS")
     h, m, s = map(int, parts)
     total = days * 86400 + h * 3600 + m * 60 + s
-    if total <= 0 or total > 86400:
-        raise argparse.ArgumentTypeError("Walltime must be >0 and <=24 hours")
+    if total <= 0:
+        raise argparse.ArgumentTypeError("Walltime must be > 0")
+    try:
+        gwas2m_config.validate_walltime(value)  # configured max_walltime only
+    except gwas2m_config.SlurmConfigError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
     return value
 
 
@@ -857,11 +861,11 @@ def arguments():
         default=DEFAULT_MAX_CANDIDATES_PER_CONTEXT_LOCUS,
     )
 
-    parser.add_argument("--partition", default=DEFAULT_PARTITION)
-    parser.add_argument("--time", type=validate_walltime, default=DEFAULT_TIME)
-    parser.add_argument("--memory", default=DEFAULT_MEMORY)
-    parser.add_argument("--cpus", type=int, default=DEFAULT_CPUS)
-    parser.add_argument("--max-parallel", type=int, default=DEFAULT_MAX_PARALLEL)
+    parser.add_argument("--partition", default=None)
+    parser.add_argument("--time", type=validate_walltime, default=None)
+    parser.add_argument("--memory", default=None)
+    parser.add_argument("--cpus", type=int, default=None)
+    parser.add_argument("--max-parallel", type=int, default=None)
     parser.add_argument("--remote-delay", type=float, default=DEFAULT_REMOTE_DELAY)
     parser.add_argument("--ld-maf", type=float, default=DEFAULT_LD_MAF)
     parser.add_argument("--ld-mismatch-s", type=float, default=DEFAULT_LD_MISMATCH_S)
@@ -870,7 +874,9 @@ def arguments():
     parser.add_argument("--tabix")
     parser.add_argument("--rscript")
     parser.add_argument("--force", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    gwas2m_config.apply_stage_defaults(args, "coloc_core")
+    return args
 
 
 def project_paths(root: Path, phenotype: str, ancestry_label: str) -> dict[str, Path]:
@@ -3520,7 +3526,7 @@ def planner_mode(root: Path, args) -> None:
     bash_text = f"""#!/bin/bash
 #SBATCH --job-name=FColoc_{slugify(phenotype)[:28]}
 #SBATCH --nodes=1
-#SBATCH --partition={args.partition}
+{chr(10).join(gwas2m_config.site_directives(args.slurm_resources))}
 #SBATCH --time={args.time}
 #SBATCH --mem={args.memory}
 #SBATCH --cpus-per-task={args.cpus}

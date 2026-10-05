@@ -70,15 +70,16 @@ import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import gwas2m_config  # noqa: E402  (SLURM settings: config/slurm.yaml)
+
 import numpy as np
 import pandas as pd
 
 STEP09_VERSION = "1.0.1"
-DEFAULT_PARTITION = "general"
-DEFAULT_TIME = "24:00:00"
-DEFAULT_MEMORY = "64G"
+# SLURM partition/time/memory/CPUs/throttle come from config/slurm.yaml
+# (stage "spliceai"); command-line flags still override them.
 DEFAULT_CPUS = 4
-DEFAULT_MAX_PARALLEL = 2
 DEFAULT_DISTANCE = 50
 DEFAULT_MASK = 0
 THRESHOLD_HIGH_RECALL = 0.20
@@ -146,12 +147,8 @@ def parse_walltime(value: str) -> int:
 
 
 def validate_walltime(value: str) -> str:
-    seconds = parse_walltime(value)
-    if seconds <= 0:
-        raise ValueError("Walltime must be greater than zero")
-    if seconds > 86400:
-        raise ValueError("Maximum allowed walltime is 24 hours")
-    return value
+    """Central check (gwas2m_config): only a configured max_walltime applies."""
+    return gwas2m_config.validate_walltime(value)
 
 
 def safe_read_json(path: Path) -> dict:
@@ -168,20 +165,10 @@ def write_json(path: Path, payload: dict) -> None:
 
 
 def read_resource_env(root: Path) -> dict[str, str]:
-    path = root / "resource_paths.env"
-    result: dict[str, str] = {}
-    if not path.exists():
-        return result
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        if key.startswith("export "):
-            key = key[7:].strip()
-        result[key] = value.strip().strip('"').strip("'")
-    return result
+    """resource_paths.env written by Step00 (shared parser in gwas2m_resources)."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import gwas2m_resources
+    return gwas2m_resources.load_resource_paths(root)
 
 
 def run_command(command, *, log_file: Path | None = None, env: dict | None = None) -> str:
@@ -253,7 +240,7 @@ def safe_int(value):
         return np.nan
 
 
-def arguments():
+def arguments(argv=None):
     parser = argparse.ArgumentParser(
         description="Run phenotype-agnostic SpliceAI on Step08 QTL-integrated variants."
     )
@@ -265,11 +252,11 @@ def arguments():
         default=None,
         help="Run exactly one SPLICEAI_TASK_ID from the existing manifest.",
     )
-    parser.add_argument("--partition", default=DEFAULT_PARTITION)
-    parser.add_argument("--time", default=DEFAULT_TIME)
-    parser.add_argument("--memory", default=DEFAULT_MEMORY)
-    parser.add_argument("--cpus", type=int, default=DEFAULT_CPUS)
-    parser.add_argument("--max-parallel", type=int, default=DEFAULT_MAX_PARALLEL)
+    parser.add_argument("--partition", default=None)
+    parser.add_argument("--time", default=None)
+    parser.add_argument("--memory", default=None)
+    parser.add_argument("--cpus", type=int, default=None)
+    parser.add_argument("--max-parallel", type=int, default=None)
     parser.add_argument("--distance", type=int, default=DEFAULT_DISTANCE)
     parser.add_argument(
         "--mask",
@@ -283,7 +270,9 @@ def arguments():
     parser.add_argument("--bcftools", default=None, help="Explicit bcftools executable path.")
     parser.add_argument("--samtools", default=None, help="Explicit samtools executable path.")
     parser.add_argument("--force", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    gwas2m_config.apply_stage_defaults(args, "spliceai")
+    return args
 
 
 def validate_arguments(args) -> None:
@@ -294,8 +283,8 @@ def validate_arguments(args) -> None:
         raise ValueError("--index must be >= 1")
     if args.cpus < 1:
         raise ValueError("--cpus must be >= 1")
-    if args.max_parallel < 1:
-        raise ValueError("--max-parallel must be >= 1")
+    if args.max_parallel < 0:
+        raise ValueError("--max-parallel must be >= 0 (0 = no throttle)")
     if args.distance < 1:
         raise ValueError("--distance must be >= 1")
 
@@ -356,13 +345,74 @@ def resolve_resources(root: Path, args) -> dict[str, Path]:
         )
     fai = Path(str(fasta) + ".fai")
     if not fai.exists() or fai.stat().st_size == 0:
-        run_command([samtools, "faidx", fasta])
+        # Shared resource: indexed once by Step00 setup, never inside a study run.
+        raise FileNotFoundError(
+            f"GRCh38 FASTA index missing: {fai}\n"
+            "Required shared resource is unavailable. Run:\n"
+            "  python Step00_Check_Resources.py --inspect\n"
+            "then:\n"
+            "  python Step00_Check_Resources.py --resources-only"
+        )
     return {
         "SPLICEAI": spliceai,
         "BCFTOOLS": bcftools,
         "SAMTOOLS": samtools,
         "FASTA": fasta,
     }
+
+
+def build_spliceai_row(
+    args,
+    task_id: int,
+    accession: str,
+    qtl_root: Path,
+    out_root: Path,
+    phenotype: str,
+    ancestry_code: str,
+    ancestry_label: str,
+    resources: dict[str, Path],
+) -> tuple[dict | None, dict | None]:
+    """One SpliceAI manifest row (shared by planner_mode and Step01_10_Run.py).
+
+    Returns (manifest_row, None) or (None, exclusion_record).
+    """
+    study_dir = qtl_root / accession
+    summary_file = study_dir / "qtl_summary.json"
+    summary = safe_read_json(summary_file)
+    input_file = study_dir / f"{accession}_GTEx_QTL_variant_summary.tsv"
+    reason = ""
+    if not summary:
+        reason = "Step08 qtl_summary.json missing/unreadable"
+    elif str(summary.get("STATUS", "")).upper() != "COMPLETE":
+        reason = f"Step08 status is {summary.get('STATUS', 'UNKNOWN')}"
+    elif not input_file.exists() or input_file.stat().st_size == 0:
+        reason = "Step08 variant summary missing/empty"
+    if reason:
+        return None, {
+            "STUDY_ACCESSION": accession,
+            "STEP08_STATUS": summary.get("STATUS", ""),
+            "REASON": reason,
+        }
+
+    return {
+        "SPLICEAI_TASK_ID": task_id,
+        "STUDY_ACCESSION": accession,
+        "PHENOTYPE": phenotype,
+        "ANCESTRY_CODE": ancestry_code,
+        "ANCESTRY_LABEL": ancestry_label,
+        "STEP08_VARIANT_FILE": str(input_file.resolve()),
+        "STEP08_SUMMARY_FILE": str(summary_file.resolve()),
+        "OUTPUT_DIR": str((out_root / accession).resolve()),
+        "SPLICEAI": str(resources["SPLICEAI"]),
+        "BCFTOOLS": str(resources["BCFTOOLS"]),
+        "SAMTOOLS": str(resources["SAMTOOLS"]),
+        "GRCH38_FASTA": str(resources["FASTA"]),
+        "ANNOTATION": ANNOTATION,
+        "DISTANCE": args.distance,
+        "MASK": args.mask,
+        "FORCE": bool(args.force),
+        "STEP09_VERSION": STEP09_VERSION,
+    }, None
 
 
 def planner_mode(args) -> None:
@@ -389,47 +439,23 @@ def planner_mode(args) -> None:
         if not study_dir.is_dir():
             continue
         accession = study_dir.name
-        summary_file = study_dir / "qtl_summary.json"
-        summary = safe_read_json(summary_file)
-        input_file = study_dir / f"{accession}_GTEx_QTL_variant_summary.tsv"
-        reason = ""
-        if not summary:
-            reason = "Step08 qtl_summary.json missing/unreadable"
-        elif str(summary.get("STATUS", "")).upper() != "COMPLETE":
-            reason = f"Step08 status is {summary.get('STATUS', 'UNKNOWN')}"
-        elif not input_file.exists() or input_file.stat().st_size == 0:
-            reason = "Step08 variant summary missing/empty"
-        if reason:
-            excluded.append(
-                {
-                    "STUDY_ACCESSION": accession,
-                    "STEP08_STATUS": summary.get("STATUS", ""),
-                    "REASON": reason,
-                }
-            )
+
+        row, exclusion = build_spliceai_row(
+            args,
+            task_id=len(rows) + 1,
+            accession=accession,
+            qtl_root=qtl_root,
+            out_root=out_root,
+            phenotype=phenotype,
+            ancestry_code=ancestry_code,
+            ancestry_label=ancestry_label,
+            resources=resources,
+        )
+        if exclusion is not None:
+            excluded.append(exclusion)
             continue
 
-        rows.append(
-            {
-                "SPLICEAI_TASK_ID": len(rows) + 1,
-                "STUDY_ACCESSION": accession,
-                "PHENOTYPE": phenotype,
-                "ANCESTRY_CODE": ancestry_code,
-                "ANCESTRY_LABEL": ancestry_label,
-                "STEP08_VARIANT_FILE": str(input_file.resolve()),
-                "STEP08_SUMMARY_FILE": str(summary_file.resolve()),
-                "OUTPUT_DIR": str((out_root / accession).resolve()),
-                "SPLICEAI": str(resources["SPLICEAI"]),
-                "BCFTOOLS": str(resources["BCFTOOLS"]),
-                "SAMTOOLS": str(resources["SAMTOOLS"]),
-                "GRCH38_FASTA": str(resources["FASTA"]),
-                "ANNOTATION": ANNOTATION,
-                "DISTANCE": args.distance,
-                "MASK": args.mask,
-                "FORCE": bool(args.force),
-                "STEP09_VERSION": STEP09_VERSION,
-            }
-        )
+        rows.append(row)
 
     excluded_file = out_root / "spliceai_excluded_studies.tsv"
     pd.DataFrame(
@@ -453,20 +479,20 @@ def planner_mode(args) -> None:
 
     script_path = Path(__file__).resolve()
     bash_file = root / f"Step09_SpliceAI_{phenotype_slug}_{ancestry_slug}.sh"
-    array_spec = f"1-{len(manifest)}"
+    array_spec = gwas2m_config.array_spec(len(manifest), args.max_parallel)
     job_name = f"SpAI_{phenotype_slug}_{ancestry_code.lower()}"[:100]
 
+    sbatch_header = gwas2m_config.sbatch_header_from_args(
+        args,
+        job_name=job_name,
+        output=f"{log_root}/spliceai.%A_%a.out",
+        error=f"{log_root}/spliceai.%A_%a.err",
+        array=array_spec,
+    )
+
+
     bash_text = f'''#!/bin/bash
-#SBATCH --job-name={job_name}
-#SBATCH --nodes=1
-#SBATCH --partition={args.partition}
-#SBATCH --time={args.time}
-#SBATCH --output={log_root}/spliceai.%A_%a.out
-#SBATCH --error={log_root}/spliceai.%A_%a.err
-#SBATCH --array={array_spec}
-#SBATCH --mem={args.memory}
-#SBATCH --cpus-per-task={args.cpus}
-#SBATCH --ntasks=1
+{sbatch_header}
 
 set -euo pipefail
 cd {shlex.quote(str(root))}

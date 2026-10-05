@@ -1,0 +1,178 @@
+# =============================================================================
+# GWAS2m SLURM profile - EXAMPLE ONLY: the scheduling values that were
+# hard-coded in the scripts before the configuration refactor (UQ HPC).
+#
+# NOT the program default. Use it explicitly:
+#   python Step01_10_Run.py --phenotype migraine --ancestry EUR \
+#       --slurm-config config/uq.example.yaml
+# Contains no accounts, user names or filesystem paths.
+#
+# Before the refactor the per-step planners rejected walltimes > 24 h, while
+# the shared-resource setup jobs ran on the "ascher" partition for up to 240 h;
+# max_walltime is therefore left null and the long setup jobs carry their own
+# partition.
+# =============================================================================
+
+scheduler: slurm
+
+cluster:
+  name: uq_example
+
+slurm:
+  partition: general
+  account: null
+  qos: null
+  reservation: null
+  constraint: null
+
+  default_time: "24:00:00"
+  default_memory: "8G"
+  default_cpus: 1
+  default_nodes: 1
+  default_ntasks: 1
+
+  max_parallel: 0
+  array_limit: 1000
+  max_walltime: null
+
+  extra_sbatch_directives: []
+
+stages:
+
+  setup:
+    partition: ascher
+    time: "24:00:00"
+    memory: "16G"
+    cpus: 2
+  setup_genome:
+    partition: ascher
+    time: "24:00:00"
+    memory: "24G"
+    cpus: 4
+  setup_gtex:
+    partition: ascher
+    time: "48:00:00"
+    memory: "16G"
+    cpus: 2
+    max_parallel: 4
+  setup_1000g_download:
+    partition: ascher
+    time: "240:00:00"
+    memory: "12G"
+    cpus: 2
+    max_parallel: 6
+  setup_1000g_all:
+    partition: ascher
+    time: "120:00:00"
+    memory: "48G"
+    cpus: 4
+    max_parallel: 8
+  setup_1000g_samples:
+    partition: ascher
+    time: "01:00:00"
+    memory: "4G"
+    cpus: 1
+  setup_1000g_populations:
+    partition: ascher
+    time: "120:00:00"
+    memory: "32G"
+    cpus: 4
+    max_parallel: 12
+  setup_vep:
+    partition: ascher
+    time: "48:00:00"
+    memory: "24G"
+    cpus: 4
+  setup_pangolin_db:
+    partition: ascher
+    time: "12:00:00"
+    memory: "32G"
+    cpus: 4
+  setup_opentargets:
+    partition: ascher
+    time: "72:00:00"
+    memory: "8G"
+    cpus: 2
+    max_parallel: 2
+  setup_verify:
+    partition: ascher
+    time: "01:00:00"
+    memory: "8G"
+    cpus: 1
+
+  study:
+    time: "24:00:00"
+    memory: "100G"
+    cpus: 8
+    max_parallel: 4
+  audit:
+    time: "04:00:00"
+    memory: "8G"
+    cpus: 1
+
+  download:
+    time: "24:00:00"
+    memory: "8G"
+    cpus: 1
+    max_parallel: 4
+  qc:
+    time: "24:00:00"
+    memory: "100G"
+    cpus: 4
+  ld:
+    partition: ascher
+    time: "240:00:00"
+    memory: "80G"
+    cpus: 4
+  clumping:
+    time: "24:00:00"
+    memory: "32G"
+    cpus: 4
+    max_parallel: 4
+  finemapping:
+    time: "24:00:00"
+    memory: "64G"
+    cpus: 8
+    max_parallel: 2
+  vep:
+    time: "24:00:00"
+    memory: "32G"
+    cpus: 4
+  qtl:
+    time: "24:00:00"
+    memory: "64G"
+    cpus: 4
+  spliceai:
+    time: "24:00:00"
+    memory: "64G"
+    cpus: 4
+  pangolin:
+    time: "24:00:00"
+    memory: "64G"
+    cpus: 4
+
+  coloc_discovery:
+    time: "08:00:00"
+    memory: "16G"
+    cpus: 2
+  coloc_planner:
+    time: "02:00:00"
+    memory: "16G"
+    cpus: 2
+  coloc_extraction:
+    time: "12:00:00"
+    memory: "32G"
+    cpus: 2
+  coloc:
+    time: "01:00:00"
+    memory: "8G"
+    cpus: 1
+  aggregation:
+    time: "01:00:00"
+    memory: "8G"
+    cpus: 1
+  # older standalone Step11_Colocalize_GTEx_SuSiE.py planner
+  coloc_core:
+    time: "24:00:00"
+    memory: "64G"
+    cpus: 4

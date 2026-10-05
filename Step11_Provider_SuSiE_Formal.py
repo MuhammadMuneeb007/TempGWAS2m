@@ -78,6 +78,9 @@ import sys
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import gwas2m_config  # noqa: E402  (SLURM settings: config/slurm.yaml; scheduling only)
 from typing import Any
 
 import numpy as np
@@ -308,60 +311,60 @@ def arguments():
 
     p.add_argument(
         "--partition",
-        default="general",
+        default=None,
     )
 
     p.add_argument(
         "--discover-time",
-        default="08:00:00",
+        default=None,
     )
 
     p.add_argument(
         "--planner-time",
-        default="02:00:00",
+        default=None,
         help="Wall time for provider candidate/credible-set planning job.",
     )
 
     p.add_argument(
         "--extract-time",
-        default="12:00:00",
+        default=None,
     )
 
     p.add_argument(
         "--coloc-time",
-        default="01:00:00",
+        default=None,
     )
 
     p.add_argument(
         "--discover-memory",
-        default="16G",
+        default=None,
     )
 
     p.add_argument(
         "--planner-memory",
-        default="16G",
+        default=None,
     )
 
     p.add_argument(
         "--extract-memory",
-        default="32G",
+        default=None,
     )
 
     p.add_argument(
         "--coloc-memory",
-        default="8G",
+        default=None,
     )
 
     p.add_argument(
         "--cpus",
         type=int,
-        default=2,
+        default=None,
     )
 
     p.add_argument(
         "--max-parallel",
         type=int,
-        default=DEFAULT_MAX_PARALLEL,
+        default=None,
         help=(
             "Maximum simultaneous discovery/coloc array tasks. "
             "0 = no Step11 %N throttle."
@@ -371,7 +374,7 @@ def arguments():
     p.add_argument(
         "--max-extract-parallel",
         type=int,
-        default=DEFAULT_MAX_EXTRACT_PARALLEL,
+        default=None,
         help=(
             "Maximum simultaneous provider extraction array tasks. "
             "0 = no Step11 %N throttle."
@@ -381,7 +384,7 @@ def arguments():
     p.add_argument(
         "--array-limit",
         type=int,
-        default=DEFAULT_ARRAY_LIMIT,
+        default=None,
     )
 
     p.add_argument(
@@ -449,7 +452,49 @@ def arguments():
         help=argparse.SUPPRESS,
     )
 
-    return p.parse_args()
+    p.add_argument(
+        "--slurm-config",
+        default=None,
+        help="SLURM config file (default config/slurm.yaml); scheduling only.",
+    )
+
+    args = p.parse_args()
+    if args.slurm_config:
+        # exported, so jobs submitted from here resolve the same file
+        os.environ[gwas2m_config.CONFIG_ENV_VAR] = str(Path(args.slurm_config).resolve())
+    apply_slurm_config(args)
+    return args
+
+
+STAGE_ARGUMENTS = {
+    "coloc_discovery": {"time": "discover_time", "memory": "discover_memory", "cpus": "cpus",
+                        "max_parallel": "max_parallel"},
+    "coloc_planner": {"time": "planner_time", "memory": "planner_memory"},
+    "coloc_extraction": {"time": "extract_time", "memory": "extract_memory",
+                         "max_parallel": "max_extract_parallel"},
+    "coloc": {"time": "coloc_time", "memory": "coloc_memory"},
+}
+
+
+def apply_slurm_config(args) -> None:
+    """Fill unset scheduling flags from config/slurm.yaml (CLI values win)."""
+    for stage, mapping in STAGE_ARGUMENTS.items():
+        resources = gwas2m_config.get_stage_resources(stage)
+        for key, attribute in mapping.items():
+            if getattr(args, attribute) is None:
+                setattr(args, attribute, resources[key])
+    if args.array_limit is None:
+        args.array_limit = gwas2m_config.get_stage_resources("coloc")["array_limit"]
+
+
+def slurm_stage(args, stage: str) -> dict:
+    """Effective resources for one Step11 job type (--partition overrides config)."""
+    return gwas2m_config.get_stage_resources(stage, overrides={"partition": args.partition})
+
+
+def slurm_site(args, stage: str) -> str:
+    """partition/account/qos/... lines; empty when the config leaves them null."""
+    return "\n".join(gwas2m_config.site_directives(slurm_stage(args, stage)))
 
 
 def allowed_types(args) -> set[str]:
@@ -526,7 +571,7 @@ def build_discovery_plan(root: Path, args) -> None:
     bash.write_text(f"""#!/bin/bash
 #SBATCH --job-name=PColDisc_{slug(phenotype)[:24]}
 #SBATCH --nodes=1
-#SBATCH --partition={args.partition}
+{slurm_site(args, 'coloc_discovery')}
 #SBATCH --time={args.discover_time}
 #SBATCH --mem={args.discover_memory}
 #SBATCH --cpus-per-task={args.cpus}
@@ -1084,7 +1129,7 @@ def build_provider_plan(root: Path, args) -> None:
     extract_bash.write_text(f"""#!/bin/bash
 #SBATCH --job-name=PColExt_{slug(phenotype)[:24]}
 #SBATCH --nodes=1
-#SBATCH --partition={args.partition}
+{slurm_site(args, 'coloc_extraction')}
 #SBATCH --time={args.extract_time}
 #SBATCH --mem={args.extract_memory}
 #SBATCH --cpus-per-task={args.cpus}
@@ -1118,10 +1163,10 @@ export GWAS_PROVIDER_EXTRACT_MANIFEST={shlex.quote(str(extract_manifest))}
         bf.write_text(f"""#!/bin/bash
 #SBATCH --job-name=PColoc_{batch_no:03d}_{slug(phenotype)[:18]}
 #SBATCH --nodes=1
-#SBATCH --partition={args.partition}
+{slurm_site(args, 'coloc')}
 #SBATCH --time={args.coloc_time}
 #SBATCH --mem={args.coloc_memory}
-#SBATCH --cpus-per-task=1
+#SBATCH --cpus-per-task={slurm_stage(args, 'coloc')['cpus']}
 #SBATCH --ntasks=1
 #SBATCH --array=1-{n_batch_tasks}{throttle}
 #SBATCH --output={paths['LOG']}/coloc.B{batch_no:03d}.%A_%a.out
@@ -1142,10 +1187,10 @@ export GWAS_PROVIDER_COLOC_MANIFEST={shlex.quote(str(mf))}
     aggregate_bash.write_text(f"""#!/bin/bash
 #SBATCH --job-name=PColAgg_{slug(phenotype)[:24]}
 #SBATCH --nodes=1
-#SBATCH --partition={args.partition}
-#SBATCH --time=01:00:00
-#SBATCH --mem=8G
-#SBATCH --cpus-per-task=1
+{slurm_site(args, 'aggregation')}
+#SBATCH --time={slurm_stage(args, 'aggregation')['time']}
+#SBATCH --mem={slurm_stage(args, 'aggregation')['memory']}
+#SBATCH --cpus-per-task={slurm_stage(args, 'aggregation')['cpus']}
 #SBATCH --ntasks=1
 #SBATCH --output={paths['LOG']}/aggregate.%j.out
 #SBATCH --error={paths['LOG']}/aggregate.%j.err
@@ -1968,7 +2013,7 @@ def submit_full_dag(
         f"""#!/bin/bash
 #SBATCH --job-name=PColPlan_{slug(phenotype)[:18]}
 #SBATCH --nodes=1
-#SBATCH --partition={args.partition}
+{slurm_site(args, 'coloc_planner')}
 #SBATCH --time={args.planner_time}
 #SBATCH --mem={args.planner_memory}
 #SBATCH --cpus-per-task={args.cpus}
@@ -2015,7 +2060,7 @@ cd {shlex.quote(str(root))}
         f"""#!/bin/bash
 #SBATCH --job-name=PColExtA_{slug(phenotype)[:18]}
 #SBATCH --nodes=1
-#SBATCH --partition={args.partition}
+{slurm_site(args, 'coloc_extraction')}
 #SBATCH --time={args.extract_time}
 #SBATCH --mem={args.extract_memory}
 #SBATCH --cpus-per-task={args.cpus}
@@ -2064,10 +2109,10 @@ export GWAS_PROVIDER_EXTRACT_POOL_SIZE={extract_pool}
         f"""#!/bin/bash
 #SBATCH --job-name=PColocA_{slug(phenotype)[:18]}
 #SBATCH --nodes=1
-#SBATCH --partition={args.partition}
+{slurm_site(args, 'coloc')}
 #SBATCH --time={args.coloc_time}
 #SBATCH --mem={args.coloc_memory}
-#SBATCH --cpus-per-task=1
+#SBATCH --cpus-per-task={slurm_stage(args, 'coloc')['cpus']}
 #SBATCH --ntasks=1
 #SBATCH --array=1-{coloc_pool}{coloc_throttle}
 #SBATCH --output={paths['LOG']}/auto_coloc.%A_%a.out
@@ -2107,10 +2152,10 @@ export GWAS_PROVIDER_COLOC_POOL_SIZE={coloc_pool}
         f"""#!/bin/bash
 #SBATCH --job-name=PColAggA_{slug(phenotype)[:18]}
 #SBATCH --nodes=1
-#SBATCH --partition={args.partition}
-#SBATCH --time=01:00:00
-#SBATCH --mem=8G
-#SBATCH --cpus-per-task=1
+{slurm_site(args, 'aggregation')}
+#SBATCH --time={slurm_stage(args, 'aggregation')['time']}
+#SBATCH --mem={slurm_stage(args, 'aggregation')['memory']}
+#SBATCH --cpus-per-task={slurm_stage(args, 'aggregation')['cpus']}
 #SBATCH --ntasks=1
 #SBATCH --output={paths['LOG']}/auto_aggregate.%j.out
 #SBATCH --error={paths['LOG']}/auto_aggregate.%j.err
@@ -3525,12 +3570,9 @@ def main() -> None:
     args = arguments()
     root = Path.cwd().resolve()
 
-    if (
-        args.array_limit < 1
-        or args.array_limit > 1000
-    ):
+    if args.array_limit < 1:
         raise SystemExit(
-            "--array-limit must be between 1 and 1000"
+            "--array-limit must be >= 1 (Step11 worker pools use at most 1000 tasks per array)"
         )
 
     if args.max_parallel < 0:
