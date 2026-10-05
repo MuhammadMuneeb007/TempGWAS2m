@@ -88,6 +88,8 @@ VEP_RELEASE = "116"
 
 GTEX_RELEASE = "v11"
 
+OPEN_TARGETS_RELEASE = "26.09"
+
 REFERENCE_BUILD = "GRCh38"
 
 REFERENCE_PANEL = "1000G_GRCh38_20190312"
@@ -321,6 +323,7 @@ dependencies:
   - pigz
   - zstd
   - parallel
+  - rsync
 
   # VEP
   - ensembl-vep={VEP_RELEASE}
@@ -354,6 +357,7 @@ software_manifest = [
     ["samtools", "mamba", "samtools"],
     ["bedtools", "mamba", "bedtools"],
     ["aria2c", "mamba", "aria2"],
+    ["rsync", "mamba", "rsync"],
     ["VEP", "mamba", f"ensembl-vep={VEP_RELEASE}"],
     ["GWASLab", "pip", "gwaslab==4.2.3"],
     ["Polars", "pip", "polars[rtcompat]"],
@@ -633,6 +637,8 @@ export GENCODE50_GTF="{RESOURCES}/gencode/release50/gencode.v50.primary_assembly
 
 export GTEX_V11="{RESOURCES}/gtex/v11"
 
+export OPEN_TARGETS_26_09="{RESOURCES}/opentargets/{OPEN_TARGETS_RELEASE}"
+
 export VEP_CACHE_DIR="{RESOURCES}/vep/cache"
 
 export LD_REFERENCE_EUR="{RESOURCES}/1000G/EUR"
@@ -860,7 +866,7 @@ for name in mods:
     print(f"[OK] Python import: {{name}}")
 COREPY
 
-for TOOL in plink2 bcftools samtools tabix bgzip bedtools aria2c pigz vep Rscript; do
+for TOOL in plink2 bcftools samtools tabix bgzip bedtools aria2c pigz rsync vep Rscript; do
     test -x "$ENV/bin/$TOOL"
     echo "[OK] $TOOL -> $ENV/bin/$TOOL"
 done
@@ -2192,6 +2198,28 @@ check(
 
 
 # ----------------------------------------------------------------------
+# Open Targets 26.09
+# ----------------------------------------------------------------------
+
+OT = RES / "opentargets" / "26.09"
+
+for dataset in [
+    "study",
+    "credible_set",
+    "l2g_prediction",
+    "colocalisation",
+]:
+    d = OT / dataset
+    check(
+        f"Open Targets 26.09: {{dataset}}",
+        (d / ".complete").exists()
+        and d.exists()
+        and any(d.rglob("*.parquet")),
+        str(d),
+    )
+
+
+# ----------------------------------------------------------------------
 # FUMA reproducibility
 # ----------------------------------------------------------------------
 
@@ -2261,7 +2289,100 @@ write_file(
 
 
 # =============================================================================
-# 10 VERIFY SLURM
+# 10 OPEN TARGETS 26.09 BULK DATA
+# =============================================================================
+
+opentargets_script = f"""
+#!/bin/bash
+#SBATCH --job-name=res_ot
+{SBATCH_PARTITION}
+#SBATCH --time=72:00:00
+#SBATCH --mem=8G
+#SBATCH --cpus-per-task=2
+#SBATCH --array=1-4%2
+#SBATCH --output={LOGS}/10_opentargets.%A_%a.out
+#SBATCH --error={LOGS}/10_opentargets.%A_%a.err
+
+set -euo pipefail
+
+ROOT="{ROOT}"
+RELEASE="{OPEN_TARGETS_RELEASE}"
+BASE="rsync.ebi.ac.uk::pub/databases/opentargets/platform/$RELEASE/output"
+OUT="$ROOT/resources/opentargets/$RELEASE"
+TASK_ID="${{SLURM_ARRAY_TASK_ID:-${{1:-}}}}"
+
+if [[ -z "$TASK_ID" ]]; then
+    echo "Usage locally: bash $0 TASK_ID"
+    echo "  1=study 2=credible_set 3=l2g_prediction 4=colocalisation"
+    exit 2
+fi
+
+DATASETS=(study credible_set l2g_prediction colocalisation)
+IDX=$((TASK_ID - 1))
+if (( IDX < 0 || IDX >= ${{#DATASETS[@]}} )); then
+    echo "ERROR: invalid TASK_ID=$TASK_ID"
+    exit 2
+fi
+
+DATASET="${{DATASETS[$IDX]}}"
+DEST="$OUT/$DATASET"
+MARKER="$DEST/.complete"
+RSYNC="$(command -v rsync || true)"
+
+if [[ -z "$RSYNC" ]]; then
+    echo "ERROR: rsync not found. Run Step00 software installation first."
+    exit 2
+fi
+
+mkdir -p "$DEST"
+
+if [[ -f "$MARKER" ]] && find "$DEST" -type f -name '*.parquet' -print -quit | grep -q .; then
+    echo "[CACHE] Open Targets $RELEASE/$DATASET"
+    du -sh "$DEST" || true
+    exit 0
+fi
+
+echo "=============================================================="
+echo "OPEN TARGETS $RELEASE DOWNLOAD"
+echo "=============================================================="
+echo "Dataset : $DATASET"
+echo "Remote  : $BASE/$DATASET/"
+echo "Local   : $DEST/"
+echo
+echo "Disk before:"
+df -h "$ROOT" || true
+
+"$RSYNC" \
+    -rltv \
+    --partial \
+    --info=progress2 \
+    "$BASE/$DATASET/" \
+    "$DEST/"
+
+if ! find "$DEST" -type f -name '*.parquet' -print -quit | grep -q .; then
+    echo "ERROR: no Parquet files found after rsync for $DATASET"
+    exit 1
+fi
+
+touch "$MARKER"
+
+echo
+echo "[OK] Open Targets dataset complete: $DATASET"
+du -sh "$DEST" || true
+echo
+echo "Disk after:"
+df -h "$ROOT" || true
+"""
+
+write_file(
+    "Setup_10_Download_OpenTargets.sh",
+    opentargets_script,
+    executable=True,
+)
+
+
+# =============================================================================
+# 11 VERIFY SLURM
 # =============================================================================
 
 verify_job = f"""
@@ -2271,8 +2392,8 @@ verify_job = f"""
 #SBATCH --time=01:00:00
 #SBATCH --mem=8G
 #SBATCH --cpus-per-task=1
-#SBATCH --output={LOGS}/10_verify.%j.out
-#SBATCH --error={LOGS}/10_verify.%j.err
+#SBATCH --output={LOGS}/11_verify.%j.out
+#SBATCH --error={LOGS}/11_verify.%j.err
 
 set -euo pipefail
 
@@ -2283,7 +2404,7 @@ cd "{ROOT}"
 """
 
 write_file(
-    "Setup_10_Verify.sh",
+    "Setup_11_Verify.sh",
     verify_job,
     executable=True,
 )
@@ -2317,6 +2438,7 @@ JGENOME=$(sbatch --parsable "$ROOT/Setup_02_Download_Genome_GENCODE.sh")
 JGTEX=$(sbatch --parsable "$ROOT/Setup_03_Download_GTEx_V11.sh")
 J1000=$(sbatch --parsable "$ROOT/Setup_04_Download_1000G.sh")
 JVEP=$(sbatch --parsable "$ROOT/Setup_08_Download_VEP_Cache.sh")
+JOT=$(sbatch --parsable "$ROOT/Setup_10_Download_OpenTargets.sh")
 JALL=$(sbatch --parsable --dependency=afterok:$J1000 "$ROOT/Setup_05_Prepare_1000G_ALL.sh")
 JSAMPLES=$(sbatch --parsable --dependency=afterok:$J1000 "$ROOT/Setup_06_Prepare_1000G_Sample_Lists.sh")
 JPOP=$(sbatch --parsable --dependency=afterok:$JALL:$JSAMPLES "$ROOT/Setup_07_Prepare_1000G_Populations.sh")
@@ -2332,6 +2454,7 @@ JALL=$JALL
 JSAMPLES=$JSAMPLES
 JPOP=$JPOP
 JPANG=$JPANG
+JOT=$JOT
 JVERIFY=$JVERIFY
 EOF
 
@@ -2347,6 +2470,7 @@ echo "1000G ALL PGEN        : $JALL"
 echo "1000G sample lists    : $JSAMPLES"
 echo "1000G populations     : $JPOP"
 echo "Pangolin DB           : $JPANG"
+echo "Open Targets 26.09    : $JOT"
 echo "Final verification    : $JVERIFY"
 echo
 echo "Monitor with: squeue --me"
@@ -2479,7 +2603,7 @@ generated_files = [
     "Setup_08_Download_VEP_Cache.sh",
     "Setup_09_Build_Pangolin_DB.sh",
 
-    "Setup_10_Verify.sh",
+    "Setup_11_Verify.sh",
 
     "Setup_Submit_All_Resources.sh",
 
@@ -2542,7 +2666,7 @@ if install_only:
 if shutil.which("sbatch") is None:
     banner("RESOURCE SCRIPTS READY")
     print("SLURM sbatch is not available, so resource jobs were not submitted.")
-    print("The generated Setup_02...Setup_10 scripts are ready for a SLURM system.")
+    print("The generated Setup_02...Setup_11 scripts are ready for a SLURM system.")
     sys.exit(0)
 
 banner("STAGE 2/2 - SUBMIT SHARED RESOURCE JOBS")
