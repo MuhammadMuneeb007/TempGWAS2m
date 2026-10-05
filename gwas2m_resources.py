@@ -192,7 +192,7 @@ def _resources() -> list[dict]:
     for name, kind in (("EQTL", "eQTL"), ("SQTL", "sQTL")):
         add(id=f"GTEX_{name}", type="QTL", source="GTEx", version=GTEX_RELEASE, build=REFERENCE_BUILD,
             url=f"{GTEX_BASE}/bulk-qtl/v11/single-tissue-cis-qtl/GTEx_Analysis_v11_{kind}.tar",
-            path=f"resources/gtex/v11/qtl/{kind}", required=True, step=8, validation="gtex_pairs",
+            path=f"resources/gtex/v11/qtl/{kind}", required=True, step=8, validation="validate_gtex_<kind>: .complete + *.v11.<e|s>Genes.txt.gz (recursive)",
             extra={"tar": f"resources/gtex/v11/qtl/GTEx_Analysis_v11_{kind}.tar"},
             setup="Setup_03_Download_GTEx_V11.sh")
     add(id="GTEX_VARIANT_LOOKUP", type="QTL", source="GTEx", version=GTEX_RELEASE, build=REFERENCE_BUILD,
@@ -206,7 +206,7 @@ def _resources() -> list[dict]:
     for name, kind in (("EQTL", "eQTL"), ("SQTL", "sQTL")):
         add(id=f"GTEX_{name}_SUSIE", type="QTL", source="GTEx", version=GTEX_RELEASE, build=REFERENCE_BUILD,
             url=f"{GTEX_BASE}/bulk-qtl/v11/susie-qtl/GTEx_Analysis_v11_{kind}_SuSiE.tar",
-            path=f"resources/gtex/v11/susie/{kind}_SuSiE", required=False, step=11, validation="complete_dir",
+            path=f"resources/gtex/v11/susie/{kind}_SuSiE", required=False, step=11, validation="validate_gtex_<kind>_susie: .complete",
             setup="Setup_03_Download_GTEx_V11.sh")
     add(id="PANGOLIN_REPO", type="MODEL", source="github.com/tkzeng/Pangolin", version="pinned commit",
         build="-", url="https://github.com/tkzeng/Pangolin.git", path="external_tools/Pangolin", required=True,
@@ -223,7 +223,8 @@ def _resources() -> list[dict]:
             setup="Step11 resource fetch (not yet migrated to Step00)")
     add(id="EQTL_CATALOGUE_DENSE", type="QTL", source="eQTL Catalogue", version="r8", build=REFERENCE_BUILD,
         url="eQTL Catalogue FTP (tabix)", path="resources/coloc/eqtl_catalogue/dense", required=True, step=11,
-        validation="dir_files", setup="Step11 resource fetch (not yet migrated to Step00)")
+        validation="validate_eqtl_catalogue_dense: .tsv.gz + .tbi pairs, no partial/orphan files",
+        setup="Step11 resource fetch (not yet migrated to Step00)")
     add(id="EQTL_CATALOGUE_SUSIE_PROVIDER", type="QTL", source="eQTL Catalogue", version="r8",
         build=REFERENCE_BUILD, url="eQTL Catalogue FTP (SuSiE lbf/cs)",
         path="resources/coloc/eqtl_catalogue/susie_provider", required=True, step=11, validation="dir_files",
@@ -233,7 +234,7 @@ def _resources() -> list[dict]:
         required=False, step=11, validation="dir_files", setup="Setup_10_Download_Molecular_QTL.py")
     add(id="OPEN_TARGETS", type="ANNOTATION", source="Open Targets Platform", version=OPEN_TARGETS_RELEASE,
         build=REFERENCE_BUILD, url="rsync.ebi.ac.uk::pub/databases/opentargets/platform", env_key="OPEN_TARGETS_26_09",
-        path=f"resources/opentargets/{OPEN_TARGETS_RELEASE}", required=False, step=13, validation="dir_files",
+        path=f"resources/opentargets/{OPEN_TARGETS_RELEASE}", required=False, step=13, validation="validate_opentargets: study/credible_set/l2g_prediction/colocalisation parquet + .complete",
         setup="Setup_10_Download_OpenTargets.sh")
     return r
 
@@ -340,12 +341,181 @@ def _pair_files(directory: Path) -> list[Path]:
     return out
 
 
+# -----------------------------------------------------------------------------
+# One validation function per complex resource. Each returns
+# {"status", "detail", "path", "size_bytes"} and is the ONLY check used for
+# that resource (inspector, preflight, resource_versions.tsv).
+# -----------------------------------------------------------------------------
+
+def _result(status: str, detail: str, path: Path, size: int | None = None) -> dict:
+    return {"status": status, "detail": detail, "path": str(path), "size_bytes": size}
+
+
+def _partial_files(directory: Path) -> list[Path]:
+    return [p for p in directory.rglob("*") if p.is_file() and p.name.endswith(INCOMPLETE_SUFFIXES)]
+
+
+def _validate_gtex_extracted(root: Path, kind: str, gene_table: str) -> dict:
+    """GTEx v11 single-tissue cis-QTL archive extracted under qtl/<kind>/.
+
+    Real layout (nested, validated recursively):
+        resources/gtex/v11/qtl/<kind>/.complete
+        resources/gtex/v11/qtl/<kind>/GTEx_Analysis_v11_<kind>/*.v11.<gene_table>.txt.gz
+    """
+    base = Path(root) / "resources" / "gtex" / "v11" / "qtl" / kind
+    tar = base.parent / f"GTEx_Analysis_v11_{kind}.tar"
+    pattern = f"*.v11.{gene_table}.txt.gz"
+    tables = sorted(base.rglob(pattern)) if base.is_dir() else []
+    nonempty = [p for p in tables if p.stat().st_size > 0]
+    empty = len(tables) - len(nonempty)
+    partial = _partial_files(base) if base.is_dir() else []
+    marker = (base / ".complete").exists()
+    pairs = len(_pair_files(base))
+    extra = f"; {pairs} significant-pair files" if pairs else ""
+
+    if nonempty and marker and not empty and not partial:
+        size = _size(base)
+        return _result(AVAILABLE, f"{len(nonempty)} extracted tissue files ({pattern}) + .complete{extra}",
+                       base, size)
+    if nonempty or empty or partial:
+        reasons = []
+        if not marker:
+            reasons.append("no .complete marker")
+        if empty:
+            reasons.append(f"{empty} empty {gene_table} files")
+        if partial:
+            reasons.append(f"{len(partial)} partial download files")
+        return _result(INCOMPLETE, f"{len(nonempty)} {gene_table} files; " + ", ".join(reasons), base, _size(base))
+    if marker:
+        return _result(INCOMPLETE, f".complete present but no non-empty {pattern} under {base.name}/", base)
+    if tar.exists() or _partial_siblings(tar):
+        return _result(INCOMPLETE, f"archive {tar.name} present but not extracted", base)
+    return _result(MISSING, "", base)
+
+
+def validate_gtex_eqtl(root: Path) -> dict:
+    return _validate_gtex_extracted(root, "eQTL", "eGenes")
+
+
+def validate_gtex_sqtl(root: Path) -> dict:
+    return _validate_gtex_extracted(root, "sQTL", "sGenes")
+
+
+def _validate_gtex_susie(root: Path, kind: str) -> dict:
+    """Unchanged rule: extracted SuSiE archive directory with a .complete marker."""
+    path = Path(root) / "resources" / "gtex" / "v11" / "susie" / f"{kind}_SuSiE"
+    if (path / ".complete").exists():
+        return _result(AVAILABLE, "", path, _size(path))
+    if path.exists():
+        return _result(INCOMPLETE, "no .complete marker", path, _size(path))
+    return _result(MISSING, "", path)
+
+
+def validate_gtex_eqtl_susie(root: Path) -> dict:
+    return _validate_gtex_susie(root, "eQTL")
+
+
+def validate_gtex_sqtl_susie(root: Path) -> dict:
+    return _validate_gtex_susie(root, "sQTL")
+
+
+def validate_eqtl_catalogue_dense(root: Path) -> dict:
+    """Usable unit = non-empty X.tsv.gz WITH its X.tsv.gz.tbi (Step11's local-tabix rule).
+
+    Orphan .tbi files (index without data) and *.aria2/*.part/*.tmp files make
+    the resource INCOMPLETE; an orphan index never counts as data.
+    """
+    path = Path(root) / "resources" / "coloc" / "eqtl_catalogue" / "dense"
+    if not path.is_dir():
+        return _result(MISSING, "", path)
+    partial = _partial_files(path)
+    downloading = {Path(str(p)[: -len(".aria2")]) for p in partial if p.name.endswith(".aria2")}
+    data = {p for p in path.rglob("*.tsv.gz") if p.is_file() and p.stat().st_size > 0 and p not in downloading}
+    indexes = {p for p in path.rglob("*.tsv.gz.tbi") if p.is_file() and p.stat().st_size > 0}
+    usable = {p for p in data if Path(str(p) + ".tbi") in indexes}
+    orphan_tbi = [i for i in indexes if Path(str(i)[: -len(".tbi")]) not in data]
+    unindexed = len(data) - len(usable)
+    size = sum(p.stat().st_size for p in usable) or None
+
+    problems = []
+    if partial:
+        problems.append(f"{len(partial)} partial downloads")
+    if orphan_tbi:
+        problems.append(f"{len(orphan_tbi)} orphan .tbi indexes")
+    if unindexed:
+        problems.append(f"{unindexed} .tsv.gz without .tbi")
+    if usable and not problems:
+        return _result(AVAILABLE, f"{len(usable)} datasets (.tsv.gz + .tbi)", path, size)
+    if usable or problems:
+        return _result(INCOMPLETE, f"{len(usable)} usable datasets; " + ", ".join(problems), path, size)
+    return _result(MISSING, "directory has no .tsv.gz data files", path)
+
+
+# Datasets read by Step13_OpenTargets_Detailed_Benchmark.py (REQUIRED_OT_DATASETS,
+# same aliases); Setup_10_Download_OpenTargets.sh writes <dataset>/.complete.
+OPEN_TARGETS_DATASETS = {
+    "study": ["study", "studies"],
+    "credible_set": ["credible_set", "credible_sets"],
+    "l2g_prediction": ["l2g_prediction", "l2g_predictions"],
+    "colocalisation": ["colocalisation", "colocalisation_coloc", "colocalization"],
+}
+
+
+def validate_opentargets(root: Path) -> dict:
+    """Each required dataset must have *.parquet files AND a .complete marker."""
+    path = Path(root) / "resources" / "opentargets" / OPEN_TARGETS_RELEASE
+    if not path.is_dir():
+        return _result(MISSING, "", path)
+    states, size, n_ok, any_data = [], 0, 0, False
+    for dataset, aliases in OPEN_TARGETS_DATASETS.items():
+        directory = next((path / a for a in aliases if (path / a).is_dir()), None)
+        if directory is None:
+            states.append(f"{dataset}=missing")
+            continue
+        parquet = [p for p in directory.rglob("*.parquet") if p.is_file() and p.stat().st_size > 0]
+        partial = [p for p in directory.rglob("*") if p.name.startswith(".~tmp~")
+                   or (p.is_file() and p.name.endswith(INCOMPLETE_SUFFIXES))]
+        any_data = any_data or bool(parquet)
+        if not parquet:
+            states.append(f"{dataset}=no parquet")
+        elif partial:
+            states.append(f"{dataset}=partial download")
+        elif not (directory / ".complete").exists():
+            states.append(f"{dataset}={len(parquet)} parquet, no .complete")
+        else:
+            n_ok += 1
+            size += sum(p.stat().st_size for p in parquet)
+            states.append(f"{dataset}=OK")
+    detail = "; ".join(states)
+    if n_ok == len(OPEN_TARGETS_DATASETS):
+        return _result(AVAILABLE, detail, path, size)
+    if n_ok or any_data:
+        return _result(INCOMPLETE, detail, path, size or None)
+    return _result(MISSING, detail, path)
+
+
+VALIDATORS = {
+    "GTEX_EQTL": validate_gtex_eqtl,
+    "GTEX_SQTL": validate_gtex_sqtl,
+    "GTEX_EQTL_SUSIE": validate_gtex_eqtl_susie,
+    "GTEX_SQTL_SUSIE": validate_gtex_sqtl_susie,
+    "EQTL_CATALOGUE_DENSE": validate_eqtl_catalogue_dense,
+    "OPEN_TARGETS": validate_opentargets,
+}
+
+
 def check_resource(root: Path, item: dict) -> dict:
     path = Path(root) / item["path"]
     status, detail = MISSING, ""
     method = item["validation"]
+    size = None
 
-    if method == "file":
+    if item["id"] in VALIDATORS:
+        validated = VALIDATORS[item["id"]](Path(root))
+        status, detail, size = validated["status"], validated["detail"], validated["size_bytes"]
+        path = Path(validated["path"])
+        method = "validator"
+    elif method == "file":
         status, detail = _file_status(path)
     elif method == "file+fai":
         status, detail = _file_status(path)
@@ -374,22 +544,6 @@ def check_resource(root: Path, item: dict) -> dict:
             status, detail = VERSION_MISMATCH, f"found {', '.join(releases)}; expected {wanted}"
         else:
             status = MISSING
-    elif method == "gtex_pairs":
-        files = _pair_files(path)
-        tar = Path(root) / item["extra"]["tar"]
-        if files and (path / ".complete").exists():
-            status, detail = AVAILABLE, f"{len(files)} significant-pair files"
-        elif files:
-            status, detail = INCOMPLETE, f"{len(files)} files but no .complete marker (extraction unfinished?)"
-        elif tar.exists() or _partial_siblings(tar):
-            status, detail = INCOMPLETE, "archive present but not extracted"
-        else:
-            status = MISSING
-    elif method == "complete_dir":
-        if (path / ".complete").exists():
-            status = AVAILABLE
-        elif path.exists():
-            status, detail = INCOMPLETE, "no .complete marker"
     elif method == "git_repo":
         status = AVAILABLE if (path / ".git").exists() else (INVALID if path.exists() else MISSING)
     elif method == "dir_files":
@@ -406,7 +560,8 @@ def check_resource(root: Path, item: dict) -> dict:
 
     if status == MISSING and not item["required"]:
         status = OPTIONAL_MISSING
-    size = _size(path) if status in {AVAILABLE, INCOMPLETE, VERSION_MISMATCH} and method != "dir_files" else None
+    if method != "validator":
+        size = _size(path) if status in {AVAILABLE, INCOMPLETE, VERSION_MISMATCH} and method != "dir_files" else None
     return {
         "id": item["id"], "type": item["type"], "status": status, "detail": detail,
         "path": str(path), "required": item["required"], "step": item["step"],
