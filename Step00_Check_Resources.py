@@ -2630,16 +2630,43 @@ if [[ -s "$STATE" ]]; then
     fi
 fi
 
-JGENOME=$(sbatch --parsable "$ROOT/Setup_02_Download_Genome_GENCODE.sh")
-JGTEX=$(sbatch --parsable "$ROOT/Setup_03_Download_GTEx_V11.sh")
-J1000=$(sbatch --parsable "$ROOT/Setup_04_Download_1000G.sh")
-JVEP=$(sbatch --parsable "$ROOT/Setup_08_Download_VEP_Cache.sh")
-JOT=$(sbatch --parsable "$ROOT/Setup_10_Download_OpenTargets.sh")
-JALL=$(sbatch --parsable --dependency=afterok:$J1000 "$ROOT/Setup_05_Prepare_1000G_ALL.sh")
-JSAMPLES=$(sbatch --parsable --dependency=afterok:$J1000 "$ROOT/Setup_06_Prepare_1000G_Sample_Lists.sh")
-JPOP=$(sbatch --parsable --dependency=afterok:$JALL:$JSAMPLES "$ROOT/Setup_07_Prepare_1000G_Populations.sh")
-JPANG=$(sbatch --parsable --dependency=afterok:$JGENOME "$ROOT/Setup_09_Build_Pangolin_DB.sh")
-JVERIFY=$(sbatch --parsable --dependency=afterok:$JGENOME:$JGTEX:$J1000:$JVEP:$JALL:$JSAMPLES:$JPOP:$JPANG "$ROOT/Setup_11_Verify.sh")
+# NEED_*=0 skips a job whose resources Step00 already validated (Step00 sets
+# these from its read-only inspection; run by hand, everything is submitted).
+submit_job() {{
+    # submit_job <NEED flag> <script> [dependency job ids...]
+    local need="$1" script="$2"
+    shift 2
+    if [[ "$need" != "1" ]]; then
+        echo ""
+        return 0
+    fi
+    local deps=""
+    for jid in "$@"; do
+        [[ -n "$jid" ]] && deps="$deps:$jid"
+    done
+    if [[ -n "$deps" ]]; then
+        sbatch --parsable --dependency=afterok$deps "$script"
+    else
+        sbatch --parsable "$script"
+    fi
+}}
+
+JGENOME=$(submit_job "${{NEED_GENOME:-1}}" "$ROOT/Setup_02_Download_Genome_GENCODE.sh")
+JGTEX=$(submit_job "${{NEED_GTEX:-1}}" "$ROOT/Setup_03_Download_GTEx_V11.sh")
+J1000=$(submit_job "${{NEED_1000G_RAW:-1}}" "$ROOT/Setup_04_Download_1000G.sh")
+JVEP=$(submit_job "${{NEED_VEP:-1}}" "$ROOT/Setup_08_Download_VEP_Cache.sh")
+JOT=$(submit_job "${{NEED_OPENTARGETS:-1}}" "$ROOT/Setup_10_Download_OpenTargets.sh")
+JALL=$(submit_job "${{NEED_1000G_ALL:-1}}" "$ROOT/Setup_05_Prepare_1000G_ALL.sh" "$J1000")
+JSAMPLES=$(submit_job "${{NEED_1000G_POPULATIONS:-1}}" "$ROOT/Setup_06_Prepare_1000G_Sample_Lists.sh" "$J1000")
+JPOP=$(submit_job "${{NEED_1000G_POPULATIONS:-1}}" "$ROOT/Setup_07_Prepare_1000G_Populations.sh" "$JALL" "$JSAMPLES")
+JPANG=$(submit_job "${{NEED_PANGOLIN_DB:-1}}" "$ROOT/Setup_09_Build_Pangolin_DB.sh" "$JGENOME")
+
+ANY="$JGENOME$JGTEX$J1000$JVEP$JOT$JALL$JSAMPLES$JPOP$JPANG"
+if [[ -z "$ANY" ]]; then
+    echo "[SKIP] Every shared resource is already validated; nothing submitted."
+    exit 0
+fi
+JVERIFY=$(submit_job 1 "$ROOT/Setup_11_Verify.sh" "$JGENOME" "$JGTEX" "$J1000" "$JVEP" "$JALL" "$JSAMPLES" "$JPOP" "$JPANG")
 
 cat > "$STATE" <<EOF
 JGENOME=$JGENOME
@@ -2658,15 +2685,15 @@ echo
 echo "=============================================================="
 echo "RESOURCE SETUP SUBMITTED"
 echo "=============================================================="
-echo "Genome/GENCODE        : $JGENOME"
-echo "GTEx V11              : $JGTEX"
-echo "1000G raw             : $J1000"
-echo "VEP cache             : $JVEP"
-echo "1000G ALL PGEN        : $JALL"
-echo "1000G sample lists    : $JSAMPLES"
-echo "1000G populations     : $JPOP"
-echo "Pangolin DB           : $JPANG"
-echo "Open Targets 26.09    : $JOT"
+echo "Genome/GENCODE        : ${{JGENOME:-skipped (validated)}}"
+echo "GTEx V11              : ${{JGTEX:-skipped (validated)}}"
+echo "1000G raw             : ${{J1000:-skipped (validated)}}"
+echo "VEP cache             : ${{JVEP:-skipped (validated)}}"
+echo "1000G ALL PGEN        : ${{JALL:-skipped (validated)}}"
+echo "1000G sample lists    : ${{JSAMPLES:-skipped (validated)}}"
+echo "1000G populations     : ${{JPOP:-skipped (validated)}}"
+echo "Pangolin DB           : ${{JPANG:-skipped (validated)}}"
+echo "Open Targets 26.09    : ${{JOT:-skipped (validated)}}"
 echo "Final verification    : $JVERIFY"
 echo
 echo "Monitor with: squeue --me"
@@ -2773,6 +2800,7 @@ generated_files = [
 
     "Setup_08_Download_VEP_Cache.sh",
     "Setup_09_Build_Pangolin_DB.sh",
+    "Setup_10_Download_OpenTargets.sh",
 
     "Setup_11_Verify.sh",
 
@@ -2852,8 +2880,36 @@ if shutil.which("sbatch") is None:
     sys.exit(0)
 
 banner("STAGE 2/2 - SUBMIT SHARED RESOURCE JOBS")
+
+# Idempotent setup: only jobs whose resources are not yet validated are
+# submitted (same read-only checks as --inspect).
+_status = {
+    item["id"]: gwas2m_resources.check_resource(ROOT, item)["status"]
+    for item in gwas2m_resources.RESOURCES
+}
+
+
+def _need(*resource_ids: str) -> str:
+    return "1" if any(_status[r] != gwas2m_resources.AVAILABLE for r in resource_ids) else "0"
+
+
+_needs = {
+    "NEED_GENOME": _need("GRCH38_FASTA", "GENCODE_GTF"),
+    "NEED_GTEX": _need("GTEX_EQTL", "GTEX_SQTL", "GTEX_EQTL_SUSIE", "GTEX_SQTL_SUSIE",
+                       "GTEX_VARIANT_LOOKUP", "GTEX_GENCODE47"),
+    "NEED_1000G_RAW": _need("1000G_RAW_VCF", "1000G_PANEL_METADATA"),
+    "NEED_1000G_ALL": _need("1000G_ALL_PGEN"),
+    "NEED_1000G_POPULATIONS": _need(*[f"1000G_{a}" for a in gwas2m_resources.LD_ANCESTRIES]),
+    "NEED_VEP": _need("VEP_CACHE"),
+    "NEED_PANGOLIN_DB": _need("PANGOLIN_DB"),
+    "NEED_OPENTARGETS": _need("OPEN_TARGETS"),
+}
+for _key, _value in _needs.items():
+    os.environ[_key] = _value
+    print(f"{_key:<24}: {'submit' if _value == '1' else 'skip (validated)'}")
+
 run(["bash", str(ROOT / "Setup_Submit_All_Resources.sh")],
-    label="Submit resumable resource DAG")
+    label="Submit resumable resource DAG (missing resources only)")
 write_resource_versions()
 
 banner("BOOTSTRAP STARTED SUCCESSFULLY")

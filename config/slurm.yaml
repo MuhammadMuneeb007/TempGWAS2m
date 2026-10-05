@@ -41,6 +41,8 @@ slurm:
 stages:
 
   # ---- Step00 shared-resource setup jobs (fall back to "setup") ------------
+  # Capped at 24 h: every setup job is resumable (re-running continues it).
+  # Raise only if your partition allows longer jobs (see uq.example.yaml).
   setup:
     time: "24:00:00"
     memory: "16G"
@@ -50,15 +52,15 @@ stages:
     memory: "24G"
     cpus: 4
   setup_gtex:
-    time: "48:00:00"
+    time: "24:00:00"
     memory: "16G"
     cpus: 2
   setup_1000g_download:
-    time: "240:00:00"
+    time: "24:00:00"
     memory: "12G"
     cpus: 2
   setup_1000g_all:
-    time: "120:00:00"
+    time: "24:00:00"
     memory: "48G"
     cpus: 4
   setup_1000g_samples:
@@ -66,11 +68,11 @@ stages:
     memory: "4G"
     cpus: 1
   setup_1000g_populations:
-    time: "120:00:00"
+    time: "24:00:00"
     memory: "32G"
     cpus: 4
   setup_vep:
-    time: "48:00:00"
+    time: "24:00:00"
     memory: "24G"
     cpus: 4
   setup_pangolin_db:
@@ -78,7 +80,7 @@ stages:
     memory: "32G"
     cpus: 4
   setup_opentargets:
-    time: "72:00:00"
+    time: "24:00:00"
     memory: "8G"
     cpus: 2
   setup_verify:
